@@ -1,0 +1,69 @@
+# Continuous integration for pull requests and feature branches:
+# typecheck → unit tests → production build → Playwright smoke tests.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore: [main]
+
+permissions:
+  contents: read
+
+# Supersede older runs of the same branch / PR.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 22
+
+jobs:
+  check:
+    name: Typecheck, test, build, e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_BASE: /loxdetective/
+
+      # Some CI images ship Chromium at /opt/pw-browsers (see playwright.config.ts);
+      # otherwise download the browser Playwright was pinned against.
+      - name: Install Playwright Chromium
+        run: if [ -x /opt/pw-browsers/chromium ]; then echo bundled; else npx playwright install --with-deps chromium; fi
+
+      - name: End-to-end smoke tests
+        run: npm run e2e
+        env:
+          CI: "true"
+
+      - name: Upload Playwright artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-artifacts
+          path: |
+            playwright-report
+            test-results
+          if-no-files-found: ignore
+          retention-days: 7

@@ -352,3 +352,22 @@ export interface AppSettings {
   enableSanctionsFeed: boolean;
   currency: 'usd';
 }
+
+/**
+ * A token allowance granted by an address (EVM). Produced by the EVM façade
+ * (`getApprovals`) from on-chain `Approval` / `ApprovalForAll` logs.
+ */
+export interface ApprovalInfo {
+  token: TokenInfo;
+  /** Spender (ERC-20) or operator (ERC-721/1155 `setApprovalForAll`). */
+  spender: string;
+  /** Allowance in token base units; `maxUint256` for `ApprovalForAll(true)`. */
+  amount: bigint;
+  /** true when the allowance is effectively infinite (>= 2^255 or ApprovalForAll). */
+  unlimited: boolean;
+  txHash: string;
+  timestamp?: number;
+  blockNumber?: number;
+  /** Label of the spender when known (filled by the UI / intel layer). */
+  spenderLabel?: string;
+}

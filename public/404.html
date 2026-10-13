@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="robots" content="noindex" />
+    <title>LoxDetective — redirecting…</title>
+    <!--
+      GitHub Pages serves this file for any path it does not know. The app
+      uses hash routing, so a deep link such as /loxdetective/address/ethereum/0x…
+      is rewritten to /loxdetective/#/address/ethereum/0x… and the SPA takes
+      over. Without JavaScript we simply fall back to the home route.
+    -->
+    <script>
+      (function () {
+        var base = '/loxdetective/';
+        var path = window.location.pathname;
+        var rest = path.indexOf(base) === 0 ? path.slice(base.length) : path.replace(/^\/+/, '');
+        var hash = window.location.hash && window.location.hash !== '#' ? window.location.hash.replace(/^#\/?/, '') : '';
+        var route = rest.replace(/^\/+/, '') || hash;
+        window.location.replace(base + '#/' + route + window.location.search);
+      })();
+    </script>
+    <noscript><meta http-equiv="refresh" content="0; url=/loxdetective/#/" /></noscript>
+    <style>
+      body { font-family: system-ui, sans-serif; background: #0b0e14; color: #e6e9ef; display: grid; place-items: center; min-height: 100vh; margin: 0; }
+      a { color: #8fb8ff; }
+    </style>
+  </head>
+  <body>
+    <p>Redirecting to <a href="/loxdetective/#/">LoxDetective</a>…</p>
+  </body>
+</html>
