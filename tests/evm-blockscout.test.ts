@@ -12,6 +12,7 @@ import {
   normalizeSignature,
   parseTimestamp,
   txInternal,
+  txInternalPaged,
   txSummary,
   txTokenTransfers,
 } from '@/lib/providers/evm/blockscout';
@@ -137,6 +138,32 @@ describe('token transfers', () => {
     expect(b.token).toMatchObject({ symbol: 'BAYC', kind: 'ERC-721', amount: { raw: 1n, decimals: 0 } });
   });
 
+  const erc1155Batch = {
+    tx_hash: HASH,
+    timestamp: TS,
+    block_number: 100,
+    log_index: 6,
+    from: { hash: OTHER },
+    to: { hash: OWNER },
+    token: { address: BAYC, name: 'Multi', symbol: 'MULTI', decimals: null, type: 'ERC-1155' },
+    total: [
+      { token_id: '7', value: '500', decimals: null },
+      { token_id: '8', value: '2', decimals: null },
+    ],
+  };
+
+  it('sums ERC-1155 batch totals in history rows and expands them into one Transfer per id', async () => {
+    installFetch(() => ({ items: [erc1155Batch], next_page_params: null }));
+    const page = await addressTokenTransfers(ETH, OWNER);
+    expect(page.items[0].value).toEqual({ raw: 502n, decimals: 0, symbol: 'MULTI' });
+    expect(page.items[0].token).toMatchObject({ kind: 'ERC-1155', amount: { raw: 502n } });
+
+    const transfers = await txTokenTransfers(ETH, HASH);
+    expect(transfers).toHaveLength(2);
+    expect(transfers[0]).toMatchObject({ kind: 'ERC-1155', tokenId: '7', index: 6, from: OTHER, to: OWNER, amount: { raw: 500n, decimals: 0 } });
+    expect(transfers[1]).toMatchObject({ kind: 'ERC-1155', tokenId: '8', index: 6, amount: { raw: 2n, decimals: 0 } });
+  });
+
   it('txTokenTransfers maps to Transfer objects with token metadata', async () => {
     installFetch((url) => {
       expect(url.pathname).toBe(`/api/v2/transactions/${HASH}/token-transfers`);
@@ -188,6 +215,40 @@ describe('internal transactions', () => {
     const calls = await txInternal(ETH, HASH);
     expect(calls[0]).toEqual({ from: USDC, to: OWNER, value: { raw: 777n, decimals: 18, symbol: 'ETH' }, type: 'call', error: undefined });
     expect(calls[1]).toMatchObject({ type: 'delegatecall', error: 'out of gas' });
+  });
+
+  it('txInternal follows next_page_params and concatenates pages', async () => {
+    const fetchMock = installFetch((url) => {
+      expect(url.pathname).toBe(`/api/v2/transactions/${HASH}/internal-transactions`);
+      if (!url.searchParams.has('index')) return { items: [item], next_page_params: { index: 50, block_number: 100 } };
+      expect(url.searchParams.get('index')).toBe('50');
+      expect(url.searchParams.get('block_number')).toBe('100');
+      return { items: [failed], next_page_params: null };
+    });
+    const calls = await txInternal(ETH, HASH);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(calls).toHaveLength(2);
+    expect(calls[0].type).toBe('call');
+    expect(calls[1].type).toBe('delegatecall');
+  });
+
+  it('txInternal stops after 5 pages', async () => {
+    const fetchMock = installFetch(() => ({ items: [item], next_page_params: { index: 1 } }));
+    const calls = await txInternal(ETH, HASH);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+    expect(calls).toHaveLength(5);
+  });
+
+  it('txInternalPaged reports whether the explorer still had more pages', async () => {
+    installFetch(() => ({ items: [item], next_page_params: { index: 1 } }));
+    const more = await txInternalPaged(ETH, HASH);
+    expect(more.calls).toHaveLength(5);
+    expect(more.truncated).toBe(true);
+
+    installFetch((url) => (url.searchParams.has('index') ? { items: [failed], next_page_params: null } : { items: [item], next_page_params: { index: 1 } }));
+    const done = await txInternalPaged(ETH, HASH);
+    expect(done.calls).toHaveLength(2);
+    expect(done.truncated).toBe(false);
   });
 });
 

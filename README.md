@@ -175,7 +175,7 @@ The repository ships with a ready-made workflow ([`.github/workflows/deploy.yml`
 
 Notes:
 
-- If your repository is **not** called `loxdetective`, change `VITE_BASE` in the workflow (and `base` in `vite.config.ts` / `public/404.html`) to `/<repo-name>/`.
+- If your repository is **not** called `loxdetective`, change `VITE_BASE` in both workflows (`deploy.yml`, `ci.yml`) and the `/loxdetective/` default in `vite.config.ts`, `playwright.config.ts` and `public/404.html` to `/<repo-name>/`.
 - For a **custom domain** or a user site (`<you>.github.io`), set `VITE_BASE=/`.
 - The app uses hash routing (`/#/address/…`), so no server-side rewrites are needed; `public/404.html` forwards accidental deep links to the right hash route.
 - Pull requests and feature branches run [`ci.yml`](.github/workflows/ci.yml): typecheck, unit tests, build and the Playwright smoke suite.

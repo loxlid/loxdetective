@@ -118,6 +118,18 @@ describe('rpc fallback', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('treats a 2xx non-JSON-RPC body as a failure and falls back to the next endpoint', async () => {
+    const fetchMock = installFetch((url, req) => {
+      if (url === ETH.rpcUrls[0]) return '<html>challenge</html>';
+      if (url === ETH.rpcUrls[1]) return { message: 'x' };
+      if (url === ETH.rpcUrls[2]) return undefined; // empty body
+      return ok(req, '0x6080ab');
+    });
+    await expect(getCode(ETH, USDC)).resolves.toBe('0x6080ab');
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual(ETH.rpcUrls.slice(0, 4));
+  });
+
   it('throws the last error when every endpoint fails', async () => {
     installFetch(() => new HttpFailure(500));
     await expect(getBlockNumber(ETH)).rejects.toThrow(/HTTP 500/);
@@ -312,6 +324,13 @@ describe('erc20Meta', () => {
   it('propagates network failures instead of inventing metadata', async () => {
     installFetch(() => new HttpFailure(500));
     await expect(erc20Meta(ETH, USDC)).rejects.toThrow(/HTTP 500/);
+  });
+
+  it('propagates transient RPC errors (rate limits) instead of returning decimals 0', async () => {
+    installFetch((_url, req) => rpcError(req, -32005, 'rate limited'));
+    await expect(erc20Meta(ETH, USDC)).rejects.toThrow(/rate limited/);
+    installFetch((_url, req) => rpcError(req, -32000, 'missing trie node'));
+    await expect(erc20Meta(ETH, USDC)).rejects.toThrow(/missing trie node/);
   });
 
   it('decodeStringResult handles both encodings', () => {

@@ -40,6 +40,12 @@ export interface RiskInput {
   secondHopCounterparties?: Map<string, string[]>;
   /** Native coin price in USD, if known; enables the USD-based `large-value` threshold. */
   nativePriceUsd?: number;
+  /**
+   * True when the caller knows `history` and `tokenTransfers` are the full
+   * history, i.e. no further pages exist; false when they are a partial page.
+   * When omitted, `fresh-wallet` falls back to a conservative row-count guess.
+   */
+  historyComplete?: boolean;
 }
 
 export type RiskFlagId =
@@ -66,8 +72,12 @@ export const RISK_THRESHOLDS = { low: 1, medium: 25, high: 50, critical: 75 } as
 /** Tunable heuristic parameters, exported for the UI copy and tests. */
 export const RISK_PARAMS = {
   freshWalletSec: 7 * 86_400,
-  /** `fresh-wallet` is derived from history only when the history is short enough to be complete. */
-  freshWalletMaxRows: 40,
+  /**
+   * Without `historyComplete`, `fresh-wallet` is derived from history only when
+   * both row lists are shorter than this. Must be <= the smallest provider page
+   * size (Solana 25, EVM 50) so a full page can never pass as complete.
+   */
+  freshWalletMaxRows: 25,
   velocityWindowSec: 86_400,
   velocityMaxTxs: 50,
   dustMinSenders: 5,
@@ -136,6 +146,7 @@ interface Ctx {
   labelOf: (address: string) => AddressLabel | undefined;
   secondHop?: Map<string, string[]>;
   nativePriceUsd?: number;
+  historyComplete?: boolean;
 }
 
 function normalizeNow(now: number | undefined): number {
@@ -165,6 +176,7 @@ function buildCtx(input: RiskInput): Ctx {
     labelOf,
     secondHop: input.secondHopCounterparties,
     nativePriceUsd: input.nativePriceUsd,
+    historyComplete: input.historyComplete,
   };
 }
 
@@ -184,10 +196,15 @@ function counterpartyOf(row: TxListItem, self: string): string | undefined {
       cp = undefined;
       break;
     default:
-      cp = from === self ? to : from;
+      // 'unknown' = the provider found the address on neither side (e.g. a
+      // third-party transfer listed on a token contract page): no counterparty.
+      cp = undefined;
   }
   return cp && cp !== self ? cp : undefined;
 }
+
+/** False for a reverted transaction: it moved nothing, whatever `value` says. */
+const moved = (r: TxListItem): boolean => r.status !== 'failed';
 
 function isMixerLabel(l: AddressLabel | undefined): boolean {
   return !!l && (l.category === 'mixer' || MIXER_NAME_RE.test(l.name));
@@ -321,7 +338,10 @@ function checkMixerOneHop(ctx: Ctx): RiskFlag | undefined {
 /**
  * `fresh-wallet` (low): first activity less than 7 days before `now`. Uses
  * `summary.firstSeen` when present; otherwise the earliest row timestamp, but
- * only when the supplied history is short enough to plausibly be complete.
+ * only when the rows are known (`historyComplete`) or, when the caller did not
+ * say, plausibly complete: both lists shorter than any provider page and the
+ * history not shorter than the nonce. A partial page (`historyComplete: false`)
+ * is never used: its oldest row is just the oldest row of the latest page.
  */
 function checkFreshWallet(ctx: Ctx): RiskFlag | undefined {
   let firstSeen = ctx.summary?.firstSeen;
@@ -329,8 +349,11 @@ function checkFreshWallet(ctx: Ctx): RiskFlag | undefined {
     const ts = ctx.rows.map((r) => r.timestamp).filter((t): t is number => typeof t === 'number' && t > 0);
     const complete =
       ts.length > 0 &&
-      ctx.history.length < RISK_PARAMS.freshWalletMaxRows &&
-      (ctx.summary?.txCount === undefined || ctx.history.length >= ctx.summary.txCount);
+      (ctx.historyComplete === true ||
+        (ctx.historyComplete === undefined &&
+          ctx.history.length < RISK_PARAMS.freshWalletMaxRows &&
+          ctx.tokenTransfers.length < RISK_PARAMS.freshWalletMaxRows &&
+          (ctx.summary?.txCount === undefined || ctx.history.length >= ctx.summary.txCount)));
     if (complete) firstSeen = Math.min(...ts);
   }
   if (firstSeen === undefined || firstSeen <= 0) return undefined;
@@ -381,7 +404,7 @@ function checkDustPattern(ctx: Ctx): RiskFlag | undefined {
   const senders = new Map<string, number>();
   let count = 0;
   for (const r of ctx.history) {
-    if (r.direction !== 'in' || r.token) continue;
+    if (r.direction !== 'in' || r.token || !moved(r)) continue;
     const raw = r.value?.raw ?? 0n;
     if (raw <= 0n || raw >= dustThreshold(ctx.chain, r.value.decimals)) continue;
     const cp = counterpartyOf(r, ctx.self);
@@ -399,7 +422,7 @@ function checkDustPattern(ctx: Ctx): RiskFlag | undefined {
  * there are >= 2 forwards, or when >= 90% of all received value was forwarded.
  */
 function checkPassThrough(ctx: Ctx): RiskFlag | undefined {
-  const native = ctx.history.filter((r) => !r.token && typeof r.timestamp === 'number' && (r.value?.raw ?? 0n) > 0n);
+  const native = ctx.history.filter((r) => !r.token && moved(r) && typeof r.timestamp === 'number' && (r.value?.raw ?? 0n) > 0n);
   const incoming = native.filter((r) => r.direction === 'in').sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
   const outgoing = native.filter((r) => r.direction === 'out').sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
   if (!incoming.length || !outgoing.length) return undefined;
@@ -503,7 +526,7 @@ function checkLargeValue(ctx: Ctx): RiskFlag | undefined {
     evidence.push(`balance ${formatAmount(nb.balance, nb.decimals)} ${nb.symbol}`);
   }
   const big = ctx.history
-    .filter((r) => !r.token && r.value && isLargeNative(ctx, r.value.raw, r.value.decimals, r.value.symbol))
+    .filter((r) => !r.token && moved(r) && r.value && isLargeNative(ctx, r.value.raw, r.value.decimals, r.value.symbol))
     .sort((a, b) => (a.value.raw > b.value.raw ? -1 : a.value.raw < b.value.raw ? 1 : 0));
   for (const r of big) evidence.push(`${r.hash} · ${dir(r)} ${formatAmount(r.value.raw, r.value.decimals)} ${r.value.symbol}`);
   if (!evidence.length) return undefined;

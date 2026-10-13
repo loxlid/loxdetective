@@ -119,6 +119,12 @@ describe('deriveNativeTransfers', () => {
   it('yields nothing for a failed transaction that only burned the fee', () => {
     expect(deriveNativeTransfers([PAYER, RECIPIENT], [1_000_000, 5], [995_000, 5], 5_000n)).toEqual([]);
   });
+
+  it('keeps lamport precision above 2^53 when balances arrive as digit strings', () => {
+    // 10133099161583617 is not representable as a JS number (it would round to ...616).
+    const t = deriveNativeTransfers([PAYER, RECIPIENT], ['10133099161583617', '1'], ['10133099161578616', '2'], 5_000n);
+    expect(t).toEqual([{ kind: 'native', from: PAYER, to: RECIPIENT, amount: { raw: 1n, decimals: 9, symbol: 'SOL' }, index: 0 }]);
+  });
 });
 
 describe('deriveSplTransfers', () => {
@@ -308,6 +314,24 @@ describe('solTransaction', () => {
       ...overrides,
     };
   }
+
+  it('keeps lamport balances above 2^53 exact over the wire and leaves log strings untouched', async () => {
+    // Build the raw JSON-RPC body by hand: JSON.stringify cannot emit an integer literal above 2^53.
+    const tx = rawTx({ meta: { ...rawTx().meta, preBalances: ['PRE'], postBalances: ['POST'], logMessages: ['Program log: counter:12345678901234567, done'] } });
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, result: tx })
+      .replace('["PRE"]', '[10133099161583617,1,1,2039280,0,1]')
+      .replace('["POST"]', '[10133099161578616,2,1,2039280,0,1]');
+    expect(body).toContain('[10133099161583617,');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status: 200 })));
+
+    const t = await solTransaction(SIG);
+    expect(t.fee).toEqual({ raw: 5_000n, decimals: 9, symbol: 'SOL' });
+    const native = t.transfers.filter((x) => x.kind === 'native');
+    expect(native).toEqual([{ kind: 'native', from: PAYER, to: RECIPIENT, amount: { raw: 1n, decimals: 9, symbol: 'SOL' }, index: 0 }]);
+    expect(t.value.raw).toBe(1n);
+    expect(String(t.extra?.logMessages)).toBe('Program log: counter:12345678901234567, done');
+    expect(t.extra?.computeUnitsConsumed).toBe(4_200);
+  });
 
   it('derives native and SPL transfers, fee, method and logs', async () => {
     const calls = mockRpc((method, params) => {

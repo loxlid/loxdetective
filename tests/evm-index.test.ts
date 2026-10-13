@@ -185,7 +185,8 @@ describe('etherscan', () => {
     expect(page.nextCursor).toBe('4');
   });
 
-  it('uses keyless Routescan endpoints and reports the source', async () => {
+  it('uses keyless Routescan endpoints (never forwarding the Etherscan key) and reports the source', async () => {
+    useSettings.getState().set({ etherscanApiKey: 'KEY123' });
     const fetchMock = installFetch(() => null, (url) => {
       expect(url.hostname).toBe('api.routescan.io');
       expect(url.searchParams.has('apikey')).toBe(false);
@@ -466,10 +467,22 @@ describe('getTransactionFull', () => {
     expect(t.logs?.[0]).toMatchObject({ eventName: 'Transfer', logIndex: 3, decoded: { from: OWNER, to: OTHER, value: '1000000' } });
     expect(t.internal).toHaveLength(1);
     expect(t.extra).toMatchObject({ type: '0x2', transactionIndex: 2, maxFeePerGas: '2000000000', logCount: 1 });
+    expect(t.extra).not.toHaveProperty('internalTruncated');
     // Blockscout supplied the token metadata, so no eth_call round-trip was needed.
     expect(rpcCalls(fetchMock, 'eth_call')).toHaveLength(0);
   });
 
+
+  it('flags internal calls as truncated when Blockscout keeps paging past the cap', async () => {
+    const internalItem = { transaction_hash: HASH, from: { hash: USDC }, to: { hash: OTHER }, value: '0', type: 'call', success: true };
+    installFetch(rpcFor(), (url) => {
+      if (url.pathname.endsWith('/internal-transactions')) return { body: { items: [internalItem], next_page_params: { index: 1 } } };
+      return undefined;
+    });
+    const t = await getTransactionFull(ETH, HASH);
+    expect(t.internal).toHaveLength(5);
+    expect(t.extra?.internalTruncated).toBe(true);
+  });
   it('falls back to erc20Meta via RPC and the built-in selector table without Blockscout', async () => {
     const fetchMock = installFetch(rpcFor({ withMeta: true }));
     const t = await getTransactionFull(BSC, HASH);
@@ -623,7 +636,15 @@ describe('getApprovals', () => {
     const fetchMock = installFetch(handler);
     await expect(getApprovals(BASE, OWNER)).resolves.toEqual([]);
     expect(console.warn).toHaveBeenCalled();
-    // 1 wide + 5 chunks, each tried on at most 2 endpoints, never more than the budget.
-    expect(rpcCalls(fetchMock, 'eth_getLogs').length).toBeLessThanOrEqual(12);
+    // Fail fast: 1 wide + the first 400k chunk, each tried on 2 endpoints — no second-level split.
+    expect(rpcCalls(fetchMock, 'eth_getLogs')).toHaveLength(4);
+  });
+
+  it('fails fast (no second-level split) when the RPC cap is below a 400k-block chunk', async () => {
+    const { handler, ranges } = rpcWithLogs({ maxRange: 100_000 });
+    const fetchMock = installFetch(handler);
+    await expect(getApprovals(ETH, OWNER)).resolves.toEqual([]);
+    expect(ranges).toEqual([]);
+    expect(rpcCalls(fetchMock, 'eth_getLogs')).toHaveLength(4);
   });
 });

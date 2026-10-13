@@ -66,7 +66,8 @@ function isEmptyResult(message: string | undefined, result: unknown): boolean {
 async function call<T>(chain: ChainInfo, params: Record<string, string | number | undefined>, signal?: AbortSignal): Promise<T> {
   const api = chain.etherscanApi;
   if (!api) throw new Error(`Etherscan API not available for ${chain.name}`);
-  const key = getSettings().etherscanApiKey?.trim();
+  // Never send the user's Etherscan key to keyless third-party endpoints (Routescan).
+  const key = api.requiresKey ? getSettings().etherscanApiKey?.trim() : undefined;
   if (api.requiresKey && !key) throw new Error(KEY_REQUIRED_MESSAGE);
   const url = `${api.url}${qs({ ...params, chainid: api.v2ChainId, apikey: key || undefined })}`;
   const res = await fetchJson<EsEnvelope<T>>(url, { signal, timeoutMs: TIMEOUT_MS });

@@ -212,7 +212,10 @@ export function btcDirection(
   const inInputs = inputs.some((i) => i.address === address);
   const inOutputs = outputs.some((o) => o.address === address);
   const externalIn = inputs.some((i) => i.address !== address);
-  const externalOut = outputs.some((o) => o.address !== undefined && o.address !== address);
+  // An OP_RETURN output carries no value destination, so it does not make a
+  // consolidation external; any other address-less script (p2pk, bare multisig,
+  // non-standard) is a real spend to someone else.
+  const externalOut = outputs.some((o) => o.address !== address && o.scriptType !== 'op_return');
 
   if (inInputs && !externalIn && !externalOut) return { direction: 'self', net };
   if (net > 0n) return { direction: 'in', net };
@@ -236,8 +239,8 @@ export function btcTxToListItem(tx: EsploraTx, address: string): TxListItem {
     const external = largest(inputs.filter((i) => i.address && i.address !== address));
     from = coinbase ? 'coinbase' : (external?.address ?? inputs[0]?.address ?? 'unknown');
   } else if (direction === 'out') {
-    const external = largest(outputs.filter((o) => o.address && o.address !== address));
-    to = external?.address ?? address;
+    const external = largest(outputs.filter((o) => o.address !== address && o.scriptType !== 'op_return'));
+    to = external ? outputTarget(external) : 'unknown';
   }
 
   const confirmed = tx.status?.confirmed === true;

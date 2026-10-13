@@ -94,7 +94,7 @@ export const KNOWN_SOL_MINTS: Record<string, { symbol: string; name: string; dec
 /* ---------- Raw RPC shapes (subset; defensive) ---------- */
 
 interface SolAccountInfo {
-  lamports?: number;
+  lamports?: number | string;
   owner?: string;
   executable?: boolean;
   rentEpoch?: number;
@@ -143,13 +143,13 @@ interface SolRawTransaction {
   version?: 'legacy' | number;
   meta?: {
     err?: unknown;
-    fee?: number;
-    preBalances?: number[];
-    postBalances?: number[];
+    fee?: number | string;
+    preBalances?: (number | string)[];
+    postBalances?: (number | string)[];
     preTokenBalances?: SolTokenBalance[];
     postTokenBalances?: SolTokenBalance[];
     logMessages?: string[] | null;
-    computeUnitsConsumed?: number;
+    computeUnitsConsumed?: number | string;
     loadedAddresses?: { writable?: string[]; readonly?: string[] };
   } | null;
   transaction?: {
@@ -242,8 +242,8 @@ export function matchFlows(
  */
 export function deriveNativeTransfers(
   accountKeys: readonly string[],
-  preBalances: readonly number[],
-  postBalances: readonly number[],
+  preBalances: readonly (number | string)[],
+  postBalances: readonly (number | string)[],
   fee: bigint,
 ): Transfer[] {
   const decreases: { account: string; amount: bigint }[] = [];
@@ -327,7 +327,7 @@ function solEndpoints(): string[] {
 
 async function solRpc<T>(method: string, params: unknown[], signal?: AbortSignal): Promise<T> {
   try {
-    return await withFallback(solEndpoints(), (url) => jsonRpc<T>(url, method, params, { signal }), { signal });
+    return await withFallback(solEndpoints(), (url) => jsonRpc<T>(url, method, params, { signal, quoteBigInts: true }), { signal });
   } catch (err) {
     if (err instanceof RpcError) throw new Error(`Solana RPC ${method} failed: ${err.message}`);
     throw err;
@@ -344,7 +344,7 @@ export async function solAddressSummary(
   const addr = assertSolAddress(address);
   const [info, balance] = await Promise.all([
     solRpc<{ value?: SolAccountInfo | null } | null>('getAccountInfo', [addr, { encoding: 'jsonParsed', commitment: COMMITMENT }], signal),
-    solRpc<{ value?: number } | null>('getBalance', [addr, { commitment: COMMITMENT }], signal),
+    solRpc<{ value?: number | string } | null>('getBalance', [addr, { commitment: COMMITMENT }], signal),
   ]);
   const acct = info?.value ?? null;
   const lamports = toBig(balance?.value ?? acct?.lamports ?? 0);
@@ -504,7 +504,7 @@ export async function solTransaction(signature: string, signal?: AbortSignal): P
       slot: tx.slot ?? null,
       version: tx.version === undefined ? 'legacy' : String(tx.version),
       recentBlockhash: message.recentBlockhash ?? null,
-      computeUnitsConsumed: meta.computeUnitsConsumed ?? null,
+      computeUnitsConsumed: meta.computeUnitsConsumed !== undefined ? Number(meta.computeUnitsConsumed) : null,
       instructionCount: instructions.length,
       accountCount: keys.length,
       programs: programs || null,

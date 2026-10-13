@@ -339,7 +339,7 @@ export function expectNoConsoleErrors(errors: string[]): void {
   expect(unexpected, 'console errors during the test').toEqual([]);
 }
 
-/** Hash route relative to the configured baseURL (…/loxdetective/). */
+/** Hash route relative to the configured baseURL (VITE_BASE, default `/loxdetective/`). */
 export const hashRoute = (path: string): string => `#${path}`;
 export const LOAD_TIMEOUT = 20_000;
 

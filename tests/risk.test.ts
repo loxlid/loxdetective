@@ -37,6 +37,7 @@ function tx(o: {
   symbol?: string;
   decimals?: number;
   token?: TxListItem['token'];
+  status?: TxListItem['status'];
 }): TxListItem {
   const from = o.from ?? (o.direction === 'in' ? A : SELF);
   const to = o.to ?? (o.direction === 'in' ? SELF : A);
@@ -47,7 +48,7 @@ function tx(o: {
     from,
     to,
     value: { raw: o.value ?? 0n, decimals: o.decimals ?? 18, symbol: o.symbol ?? 'ETH' },
-    status: 'success',
+    status: o.status ?? 'success',
     direction: o.direction,
     token: o.token,
   };
@@ -216,6 +217,28 @@ describe('mixer-direct / sanctioned-counterparty', () => {
     expect(r.flags[0].detail).toMatch(/1 mixer contract \(15 tx\)/);
     expect(r.flags[0].evidence).toHaveLength(RISK_PARAMS.maxEvidence);
   });
+
+  it("ignores rows with direction 'unknown' (the address is on neither side)", () => {
+    // Third-party transfers (e.g. the token-transfers tab of a token contract) list the
+    // queried address on neither side; they must not become a counterparty.
+    const thirdParty = [
+      tx({ direction: 'unknown', from: TORNADO_10_ETH, to: B, value: parseEther('10'), hash: '0xt1' }),
+      tx({ direction: 'unknown', from: RONIN_EXPLOITER, to: B, value: parseEther('1'), hash: '0xt2' }),
+      tx({ direction: 'unknown', from: B, to: TORNADO_10_ETH, value: parseEther('1'), hash: '0xt3' }),
+    ];
+    const r = assess({ history: thirdParty, tokenTransfers: thirdParty });
+    expect(ids(r.flags)).not.toContain('mixer-direct');
+    expect(ids(r.flags)).not.toContain('sanctioned-counterparty');
+    expect(ids(r.flags)).not.toContain('exchange-deposit');
+    const hop = assess({
+      history: [tx({ direction: 'unknown', from: A, to: B, value: parseEther('1') })],
+      counterpartyLabels: new Map([label(C, 'mixer', 'Mixer C')]),
+      secondHopCounterparties: new Map([[A.toLowerCase(), [C]], [B.toLowerCase(), [C]]]),
+    });
+    expect(ids(hop.flags)).not.toContain('mixer-1hop');
+    // Rows that do name the address keep working.
+    expect(ids(assess({ history: [tx({ direction: 'in', from: TORNADO_10_ETH, value: 1n })] }).flags)).toEqual(['mixer-direct']);
+  });
 });
 
 describe('mixer-1hop', () => {
@@ -267,16 +290,50 @@ describe('fresh-wallet', () => {
   it('derives first-seen from a short, complete history', () => {
     const history = [tx({ direction: 'in', from: A, value: 100n, ts: NOW - 3600 }), tx({ direction: 'out', to: B, value: 1n, ts: NOW - 1800 })];
     expect(ids(assess({ history }).flags)).toEqual(['fresh-wallet']);
+    expect(ids(assess({ history, historyComplete: true }).flags)).toEqual(['fresh-wallet']);
     expect(ids(assess({ history, summary: summary(undefined, 2) }).flags)).toEqual(['fresh-wallet']);
+    expect(ids(assess({ history, summary: summary(undefined, 2), historyComplete: true }).flags)).toEqual(['fresh-wallet']);
     // nonce says there are more txs than we were given: history is a partial page, do not guess.
     expect(ids(assess({ history, summary: summary(undefined, 500) }).flags)).toEqual([]);
     // old activity → not fresh.
     expect(ids(assess({ history: [tx({ direction: 'in', from: A, value: 1n, ts: NOW - 30 * 86_400 })] }).flags)).toEqual([]);
   });
 
+  it('honours an explicit historyComplete flag over the row-count guess', () => {
+    const history = [tx({ direction: 'in', from: A, value: 100n, ts: NOW - 3600 }), tx({ direction: 'out', to: B, value: 1n, ts: NOW - 1800 })];
+    // The caller knows more pages exist: even two recent rows are just the latest page.
+    expect(ids(assess({ history, historyComplete: false }).flags)).toEqual([]);
+    expect(ids(assess({ history, summary: summary(undefined, 2), historyComplete: false }).flags)).toEqual([]);
+    // The caller knows the lists are complete: a page-sized history is fine.
+    const full = Array.from({ length: 50 }, (_, i) => tx({ direction: 'in', from: A, value: parseEther('1'), ts: NOW - 60 * i }));
+    expect(ids(assess({ history: full, historyComplete: true }).flags)).toEqual(['fresh-wallet']);
+    // ... but the summary's firstSeen still wins when present.
+    expect(ids(assess({ history, summary: summary(NOW - 30 * 86_400), historyComplete: true }).flags)).toEqual([]);
+  });
+
   it('does not derive first-seen from a long (probably paged) history', () => {
     const history = Array.from({ length: RISK_PARAMS.freshWalletMaxRows }, (_, i) => tx({ direction: 'in', from: A, value: parseEther('1'), ts: NOW - 60 * i }));
     expect(ids(assess({ history }).flags)).toEqual([]);
+    const forty = Array.from({ length: 40 }, (_, i) => tx({ direction: 'in', from: A, value: parseEther('1'), ts: NOW - 60 * i }));
+    expect(ids(assess({ history: forty }).flags)).toEqual([]);
+  });
+
+  it('does not treat a full Solana signature page as the whole history', () => {
+    // Solana pages are 25 rows and carry no txCount / firstSeen; the oldest row of the
+    // latest page is not the wallet's first activity.
+    const page = Array.from({ length: 25 }, (_, i) => tx({ chain: 'solana', direction: 'unknown', from: 'self', to: undefined, ts: NOW - 60 * i, symbol: 'SOL', decimals: 9 }));
+    const base = { chain: 'solana', address: 'self', now: NOW, summary: { chain: 'solana', address: 'self', isContract: false } } as const;
+    expect(ids(assessAddress({ ...base, history: page }).flags)).toEqual([]);
+    expect(ids(assessAddress({ ...base, history: page, historyComplete: false }).flags)).toEqual([]);
+    expect(ids(assessAddress({ ...base, history: page.slice(0, 10) }).flags)).toEqual(['fresh-wallet']);
+  });
+
+  it('does not derive first-seen from a token-only page when the native history is empty', () => {
+    const tokens = Array.from({ length: 50 }, (_, i) => tx({ direction: 'in', from: A, ts: NOW - 60 * i, token: { symbol: 'USDC', amount: { raw: 1n, decimals: 6, symbol: 'USDC' }, kind: 'ERC-20' } }));
+    expect(ids(assess({ history: [], tokenTransfers: tokens, summary: summary(undefined, 0) }).flags)).toEqual([]);
+    expect(ids(assess({ history: [], tokenTransfers: tokens, summary: summary(undefined, 0), historyComplete: false }).flags)).toEqual([]);
+    // A short, complete token list is still usable.
+    expect(ids(assess({ history: [], tokenTransfers: tokens.slice(0, 3), summary: summary(undefined, 0) }).flags)).toEqual(['fresh-wallet']);
   });
 });
 
@@ -324,6 +381,8 @@ describe('dust-pattern', () => {
     expect(ids(assess({ history: Array.from({ length: 5 }, (_, i) => tx({ direction: 'out', to: sender(i), value: 1n, ts: old })) }).flags)).toEqual([]);
     const tokenDust = Array.from({ length: 5 }, (_, i) => tx({ direction: 'in', from: sender(i), value: 1n, ts: old, token: { symbol: 'X', amount: { raw: 1n, decimals: 18, symbol: 'X' }, kind: 'ERC-20' } }));
     expect(ids(assess({ history: tokenDust }).flags)).toEqual([]);
+    const failedDust = Array.from({ length: 5 }, (_, i) => tx({ direction: 'in', from: sender(i), value: 1n, ts: old, status: 'failed' }));
+    expect(ids(assess({ history: failedDust }).flags)).toEqual([]);
   });
 
   it('uses a 1,000 sat threshold on bitcoin', () => {
@@ -349,6 +408,22 @@ describe('pass-through', () => {
     expect(r.flags[0].level).toBe('medium');
     expect(r.flags[0].evidence).toEqual([expect.stringMatching(/^0xin1 → 0xout1/), expect.stringMatching(/^0xin2 → 0xout2/)]);
     expect(r.flags[0].detail).toMatch(/100% of received value/);
+  });
+
+  it('ignores failed (reverted) transactions, which moved nothing', () => {
+    const history = [
+      tx({ direction: 'in', from: A, value: parseEther('10'), ts: t0, hash: '0xin1' }),
+      tx({ direction: 'out', to: B, value: parseEther('10'), ts: t0 + 600, hash: '0xout1', status: 'failed' }),
+      tx({ direction: 'in', from: A, value: parseEther('5'), ts: t0 + 7200, hash: '0xin2' }),
+      tx({ direction: 'out', to: B, value: parseEther('5'), ts: t0 + 7200 + 600, hash: '0xout2', status: 'failed' }),
+    ];
+    expect(ids(assess({ history }).flags)).toEqual([]);
+    // A failed deposit does not count as received value either.
+    const failedIn = [
+      tx({ direction: 'in', from: A, value: parseEther('10'), ts: t0, hash: '0xin1', status: 'failed' }),
+      tx({ direction: 'out', to: B, value: parseEther('10'), ts: t0 + 600, hash: '0xout1' }),
+    ];
+    expect(ids(assess({ history: failedIn }).flags)).toEqual([]);
   });
 
   it('fires on a single forward when it covers >= 90% of all received value', () => {
@@ -476,6 +551,11 @@ describe('large-value', () => {
     expect(r.flags[0].evidence?.[0]).toMatch(/^0xbig · received from 100 ETH/);
     expect(r.score).toBe(0);
     expect(ids(assess({ history: [tx({ direction: 'in', from: A, value: parseEther('49') })] }).flags)).toEqual([]);
+  });
+
+  it('ignores a failed (reverted) large transfer', () => {
+    expect(ids(assess({ history: [tx({ direction: 'out', to: A, value: parseEther('100'), status: 'failed' })] }).flags)).toEqual([]);
+    expect(ids(assess({ history: [tx({ direction: 'out', to: A, value: parseEther('100'), status: 'pending' })] }).flags)).toEqual(['large-value']);
   });
 
   it('uses the USD threshold when a native price is supplied', () => {

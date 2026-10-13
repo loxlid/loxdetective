@@ -69,6 +69,22 @@ test.describe('LoxDetective smoke', () => {
     expectNoConsoleErrors(consoleErrors);
   });
 
+  test('skip link moves focus to the main region without navigating the hash router', async ({ page, consoleErrors }) => {
+    await page.goto(hashRoute('/about'));
+    const main = page.locator('main#main');
+    await expect(main).toContainText('About LoxDetective', { timeout: LOAD_TIMEOUT });
+
+    // The skip link is the first focusable element; activating it must not turn `#main` into a route.
+    await page.keyboard.press('Tab');
+    await expect(page.locator('a.skip-link')).toBeFocused();
+    await page.keyboard.press('Enter');
+
+    await expect.poll(() => page.evaluate(() => location.hash)).toBe('#/about');
+    await expect.poll(() => page.evaluate(() => document.activeElement?.id)).toBe('main');
+    await expect(main).toContainText('About LoxDetective');
+    expectNoConsoleErrors(consoleErrors);
+  });
+
   test('cases: a new case and its note survive a reload', async ({ page, consoleErrors }) => {
     await page.goto(hashRoute('/cases'));
     const casesPage = page.getByTestId('cases-page');

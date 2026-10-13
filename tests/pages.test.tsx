@@ -180,6 +180,9 @@ function answerRpc(r: RpcReq, url: string): unknown {
   }
 }
 
+/** When set, Blockscout's internal-transactions endpoint keeps returning a next page (truncation path). */
+let internalCallsEndless = false;
+
 /** Mock fetch: JSON-RPC, Blockscout, Esplora, DefiLlama; 404 elsewhere. */
 function installFetch(): ReturnType<typeof vi.fn> {
   const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -193,6 +196,9 @@ function installFetch(): ReturnType<typeof vi.fn> {
       const segments = path.split('/api/v2/')[1]?.split('/').filter(Boolean) ?? [];
       if (segments[0] === 'addresses' && segments.length === 2) {
         return jsonResponse({ hash: segments[1], is_contract: false, is_verified: false, name: null, ens_domain_name: null, token: null });
+      }
+      if (internalCallsEndless && segments[segments.length - 1] === 'internal-transactions') {
+        return jsonResponse({ items: [{ transaction_hash: TX_HASH, from: { hash: USDC }, to: { hash: ADDRESS }, value: '0', type: 'call', success: true }], next_page_params: { index: 1 } });
       }
       if (COLLECTIONS.has(segments[segments.length - 1] ?? '')) return jsonResponse({ items: [], next_page_params: null });
       return jsonResponse({ message: 'Not found' }, 404);
@@ -428,6 +434,20 @@ describe('TxPage', () => {
     m.unmount();
   });
 
+  it('tells the reader when the explorer has more internal calls than were fetched', async () => {
+    internalCallsEndless = true;
+    try {
+      const m = await mount(<TxPage />, `/tx/ethereum/${TX_HASH}`, '/tx/:chain/:hash');
+      const c = m.container;
+      await waitFor(() => (c.textContent ?? '').includes('explorer has more'));
+      expect(c.textContent).toContain('first 5 calls (explorer has more)');
+      expect(c.textContent).not.toContain('internalTruncated');
+      m.unmount();
+    } finally {
+      internalCallsEndless = false;
+    }
+  });
+
   it('renders a Bitcoin transaction with inputs and outputs', async () => {
     const m = await mount(<TxPage />, `/tx/bitcoin/${BTC_TXID}`, '/tx/:chain/:hash');
     const c = m.container;
@@ -476,6 +496,37 @@ describe('TracePage', () => {
     expect(c.querySelectorAll('button').length).toBeGreaterThan(0);
     expect((byTestId(c, 'trace-run') as HTMLButtonElement).disabled).toBe(false);
     expect(byTestId(c, 'trace-run')?.textContent).toContain('Run again');
+    m.unmount();
+  });
+
+  it('lets the numeric options be cleared and retyped, clamping only on blur', async () => {
+    const m = await mount(<TracePage />, `/trace/ethereum/${ADDRESS}`, '/trace/:chain/:address');
+    const hops = byTestId(m.container, 'trace-max-hops') as HTMLInputElement;
+    const fanout = byTestId(m.container, 'trace-max-fanout') as HTMLInputElement;
+    expect(hops.value).toBe('2');
+    expect(fanout.value).toBe('8');
+    const setValue = (el: HTMLInputElement, value: string) => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(el, value);
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+    };
+    const blur = (el: HTMLInputElement) => el.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+    // Clearing does not snap to the minimum mid-edit; the next digit is the whole value.
+    await act(async () => setValue(hops, ''));
+    expect(hops.value).toBe('');
+    await act(async () => setValue(hops, '3'));
+    expect(hops.value).toBe('3');
+    await act(async () => blur(hops));
+    expect(hops.value).toBe('3');
+    // Out-of-range values clamp on commit; an empty field resets to the default.
+    await act(async () => setValue(hops, '99'));
+    await act(async () => blur(hops));
+    expect(hops.value).toBe('4');
+    await act(async () => setValue(fanout, ''));
+    await act(async () => blur(fanout));
+    expect(fanout.value).toBe('8');
+    await act(async () => setValue(fanout, '0'));
+    await act(async () => blur(fanout));
+    expect(fanout.value).toBe('1');
     m.unmount();
   });
 
@@ -585,6 +636,8 @@ describe('helpers', () => {
     expect(clampInt('99', 1, 4, 2)).toBe(4);
     expect(clampInt('-1', 1, 4, 2)).toBe(1);
     expect(clampInt('abc', 1, 4, 2)).toBe(2);
+    expect(clampInt('', 1, 4, 2)).toBe(2);
+    expect(clampInt('  ', 1, 4, 2)).toBe(2);
     expect(DEFAULT_TRACE_FORM).toEqual({ maxHops: 2, maxFanOut: 8, direction: 'both', stopAtLabelled: true, minUsd: 0, includeTokens: true });
     const usdc = { chain: 'ethereum', address: USDC, name: 'USD Coin', symbol: 'USDC', decimals: 6, type: 'ERC-20' as const };
     expect(

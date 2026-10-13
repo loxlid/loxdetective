@@ -17,6 +17,9 @@ concurrency:
 
 env:
   NODE_VERSION: 22
+  # Base path for the build and for the e2e preview server (vite.config.ts and
+  # playwright.config.ts both read it) - keep in sync with deploy.yml.
+  VITE_BASE: /loxdetective/
 
 jobs:
   check:
@@ -44,8 +47,6 @@ jobs:
 
       - name: Build
         run: npm run build
-        env:
-          VITE_BASE: /loxdetective/
 
       # Some CI images ship Chromium at /opt/pw-browsers (see playwright.config.ts);
       # otherwise download the browser Playwright was pinned against.

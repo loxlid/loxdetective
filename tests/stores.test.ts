@@ -31,7 +31,7 @@ import {
   newId,
   useCases,
 } from '@/lib/cases/store';
-import { DEFAULT_SETTINGS, getSettings, rpcUrlsFor, SETTINGS_STORAGE_KEY, useSettings } from '@/lib/settings/store';
+import { DEFAULT_SETTINGS, getSettings, rpcUrlsFor, sanitizeSettings, SETTINGS_STORAGE_KEY, useSettings } from '@/lib/settings/store';
 import type { InvestigationCase } from '@/lib/types';
 
 const registerLabelsMock = vi.mocked(registerLabels);
@@ -527,6 +527,53 @@ describe('settings store', () => {
     await useSettings.persist.rehydrate();
     expect(getSettings()).toMatchObject({ heliusApiKey: 'H', theme: 'light' });
     expect(rpcUrlsFor(getChain('solana'))[0]).toBe('https://sol.example');
+  });
+});
+
+describe('settings: persisted shape validation', () => {
+  it('rehydrates a malformed blob to the defaults instead of poisoning the store', async () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ state: { customRpc: { ethereum: 'https://x', base: ['https://base.example', 7, null] }, etherscanApiKey: 5, showTestnets: 'yes', enableSanctionsFeed: false, theme: 'neon', currency: 'eur' }, version: 1 }),
+    );
+    await useSettings.persist.rehydrate();
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(getChain('ethereum').rpcUrls);
+    expect(rpcUrlsFor(getChain('base'))).toEqual(['https://base.example', ...getChain('base').rpcUrls]);
+    expect(getSettings()).toMatchObject({ etherscanApiKey: undefined, showTestnets: false, enableSanctionsFeed: false, theme: 'system', currency: 'usd' });
+    expect(getSettings().customRpc).toEqual({ base: ['https://base.example'] });
+    expect(typeof useSettings.getState().set).toBe('function');
+  });
+
+  it('survives a customRpc that is not an object and a non-object state', async () => {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ state: { customRpc: 'nope', heliusApiKey: '' }, version: 1 }));
+    await useSettings.persist.rehydrate();
+    expect(getSettings().customRpc).toEqual({});
+    expect(getSettings().heliusApiKey).toBeUndefined();
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(getChain('ethereum').rpcUrls);
+
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ state: [1, 2], version: 1 }));
+    await useSettings.persist.rehydrate();
+    expect(getSettings()).toEqual({ ...DEFAULT_SETTINGS, theme: 'system' });
+  });
+
+  it('sanitizeSettings keeps valid values and only touches present fields', () => {
+    expect(sanitizeSettings(null)).toEqual({});
+    expect(sanitizeSettings({ theme: 'dark', showTestnets: true, enableSanctionsFeed: false, alchemyApiKey: 'A' })).toEqual({
+      theme: 'dark',
+      showTestnets: true,
+      enableSanctionsFeed: false,
+      alchemyApiKey: 'A',
+    });
+    expect(sanitizeSettings({ theme: 'light', customRpc: { solana: ['https://sol.example'] } })).toEqual({ theme: 'light', customRpc: { solana: ['https://sol.example'] } });
+    // Only an explicit `false` switches the sanctions feed off; junk values keep the safe default.
+    expect(sanitizeSettings({ enableSanctionsFeed: 0, showTestnets: 1 })).toEqual({ enableSanctionsFeed: true, showTestnets: false });
+  });
+
+  it('rpcUrlsFor tolerates a customRpc that was set to a non-array at runtime', () => {
+    useSettings.setState({ customRpc: { ethereum: 'https://x' } as unknown as Record<string, string[]> });
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(getChain('ethereum').rpcUrls);
+    useSettings.setState({ customRpc: undefined as unknown as Record<string, string[]> });
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(getChain('ethereum').rpcUrls);
   });
 });
 

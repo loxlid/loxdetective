@@ -32,8 +32,8 @@ Useful commands:
 | Command | Purpose |
 | --- | --- |
 | `npm run typecheck` | TypeScript in strict mode (`noUnusedLocals`, `noUnusedParameters`) |
-| `npm test` | Vitest unit tests (`tests/**/*.test.ts`) |
-| `npx vitest run tests/<file>.test.ts` | One test file |
+| `npm test` | Vitest unit tests (`tests/**/*.test.{ts,tsx}`) |
+| `npx vitest run tests/<file>.test.ts(x)` | One test file |
 | `npm run build` | Typecheck + production build |
 | `npm run e2e` | Playwright smoke tests against the build (`npm run build` first; Chromium via `npx playwright install chromium`) |
 | `SCREENSHOTS=1 npx playwright test e2e/screenshots.spec.ts` | Regenerate `docs/screenshots/*.png` from the mocked build (skipped without the env var) |

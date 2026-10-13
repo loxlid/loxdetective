@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { lookupLabel, resetLabels } from '@/lib/intel/labels';
+import { BUILTIN_LABELS, lookupLabel, resetLabels } from '@/lib/intel/labels';
 import {
   BUILTIN_SANCTIONED,
   SANCTIONS_CACHE_KEY,
@@ -108,6 +108,21 @@ describe('BUILTIN_SANCTIONED / isSanctioned', () => {
     expect(isSanctioned(TORNADO_10_ETH.toLowerCase())?.category).toBe('sanctioned');
     expect(isSanctioned(RANDOM)).toBeUndefined();
     expect(isSanctioned('')).toBeUndefined();
+  });
+
+  it('names the Tornado stablecoin pools by their real denominations and agrees with the label list', () => {
+    const name = (a: string) => BUILTIN_SANCTIONED.find((l) => l.address.toLowerCase() === a.toLowerCase())?.name;
+    expect(name('0xd96f2B1c14Db8458374d9Aca76E26c3D18364307')).toMatch(/^Tornado Cash: 100 USDC pool/);
+    expect(name('0x4736dCf1b7A3d580672CcE6E7c65cd5cc9cFBa19')).toMatch(/^Tornado Cash: 1,000 USDC pool/);
+    expect(name('0x169AD27A470D064DEDE56a2D3ff727986b15D52B')).toMatch(/^Tornado Cash: 100 USDT pool/);
+    expect(name('0x0836222F2B2B24A3F36f98668Ed8F0B38D1a872f')).toMatch(/^Tornado Cash: 1,000 USDT pool/);
+    expect(BUILTIN_SANCTIONED.some((l) => /10,000 USDC/.test(l.name))).toBe(false);
+    // Every Tornado pool here is also a builtin label, and both files agree on the denomination.
+    for (const s of BUILTIN_SANCTIONED.filter((l) => /^Tornado Cash: .* pool/.test(l.name))) {
+      const l = BUILTIN_LABELS.find((b) => b.address.toLowerCase() === s.address.toLowerCase());
+      expect(l, s.address).toBeDefined();
+      expect(s.name.startsWith(`${l!.name} (`), `${s.name} vs ${l!.name}`).toBe(true);
+    }
   });
 
   it('registers builtin entries in the shared label registry', () => {

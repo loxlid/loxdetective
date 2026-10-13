@@ -13,6 +13,13 @@ import {
 const BINANCE_14 = '0x28C6c06298d514Db089934071355E5743bf21d60';
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const NULL_ADDR = '0x0000000000000000000000000000000000000000';
+const DEAD_ADDR = '0x000000000000000000000000000000000000dEaD';
+const UNI_V3_FACTORY = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+const CELER = '0x5427FEFA711Eff984124bFBB1AB6fbf5E3DA1820';
+const ZKEVM_BRIDGE = '0x2a3DD3EB832aF982ec71669E178424b10Dca2EDe';
+const CBBTC = '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf';
+const TORN = '0x77777FeDdddFfC19Ff86DB637967013e6C6A116C';
+const EVM_CHAINS = ['ethereum', 'base', 'arbitrum', 'optimism', 'polygon', 'bsc', 'avalanche', 'gnosis', 'zksync', 'linea', 'scroll', 'polygon-zkevm', 'blast', 'mantle', 'celo', 'fantom', 'cronos', 'moonbeam', 'sepolia'];
 const SOL_BINANCE = '5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9';
 const BTC_BITFINEX = 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97';
 const BTC_MTGOX = '1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF';
@@ -25,8 +32,10 @@ const CATEGORIES: LabelCategory[] = [
 beforeEach(() => resetLabels());
 
 describe('BUILTIN_LABELS', () => {
-  it('has at least 80 well-formed, builtin-sourced entries', () => {
-    expect(BUILTIN_LABELS.length).toBeGreaterThanOrEqual(80);
+  it('has at least 150 well-formed, builtin-sourced entries', () => {
+    expect(BUILTIN_LABELS.length).toBeGreaterThanOrEqual(150);
+    // ... covering at least 100 distinct addresses.
+    expect(new Set(BUILTIN_LABELS.map((l) => normalizeAddress(l.address))).size).toBeGreaterThanOrEqual(100);
     for (const l of BUILTIN_LABELS) {
       expect(l.source).toBe('builtin');
       expect(l.name.length).toBeGreaterThan(2);
@@ -51,13 +60,73 @@ describe('BUILTIN_LABELS', () => {
 
   it('covers the mandatory examples from the spec', () => {
     expect(lookupLabel(MULTICALL3)?.name).toMatch(/Multicall3/);
-    expect(lookupLabel('0x000000000022D473030F116dDEE9F6B43aC78BA3')?.name).toMatch(/Permit2/);
+    expect(lookupLabel(MULTICALL3, 'ethereum')?.name).toMatch(/Multicall3/);
+    expect(lookupLabel('0x000000000022D473030F116dDEE9F6B43aC78BA3', 'ethereum')?.name).toMatch(/Permit2/);
     expect(lookupLabel('34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo', 'bitcoin')?.category).toBe('exchange');
     expect(lookupLabel(BTC_MTGOX, 'bitcoin')?.name).toMatch(/Mt\. ?Gox/);
+    expect(lookupLabel(BTC_MTGOX, 'bitcoin')?.category).toBe('other'); // thief-controlled, not the exchange
     expect(lookupLabel(SOL_BINANCE, 'solana')?.category).toBe('exchange');
-    expect(lookupLabel('H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS', 'solana')?.name).toMatch(/Coinbase/);
+    expect(lookupLabel('JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', 'solana')?.name).toMatch(/Jupiter/);
+    expect(lookupLabel('CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK', 'solana')?.name).toMatch(/Raydium/);
     expect(lookupLabel('0x910Cbd523D972eb0a6f4cAe4618aD62622b39DbF', 'ethereum')?.category).toBe('mixer');
     expect(lookupLabel('0x10ED43C718714eb63d5aA57B78B54704E256024E', 'bsc')?.category).toBe('dex');
+    expect(lookupLabel('0x00000000219ab540356cBB839Cbe05303d7705Fa', 'ethereum')?.name).toMatch(/Beacon Chain Deposit/);
+    expect(lookupLabel('0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE', 'ethereum')?.name).toMatch(/^Binance 1 /);
+  });
+
+  it('names the Tornado stablecoin pools by their real denominations', () => {
+    expect(lookupLabel('0xd96f2B1c14Db8458374d9Aca76E26c3D18364307', 'ethereum')?.name).toBe('Tornado Cash: 100 USDC pool');
+    expect(lookupLabel('0x4736dCf1b7A3d580672CcE6E7c65cd5cc9cFBa19', 'ethereum')?.name).toBe('Tornado Cash: 1,000 USDC pool');
+    expect(lookupLabel('0x169AD27A470D064DEDE56a2D3ff727986b15D52B', 'ethereum')?.name).toBe('Tornado Cash: 100 USDT pool');
+    expect(lookupLabel('0x0836222F2B2B24A3F36f98668Ed8F0B38D1a872f', 'ethereum')?.name).toBe('Tornado Cash: 1,000 USDT pool');
+    expect(BUILTIN_LABELS.some((l) => /10,000 USDC/.test(l.name))).toBe(false);
+  });
+
+  it('does not categorise non-pool Tornado contracts, issuers or theft wallets as mixer / exchange', () => {
+    expect(lookupLabel(TORN, 'ethereum')?.category).toBe('token');
+    expect(lookupLabel('0x5efda50f22d34F262c29268506C5Fa42cB56A1Ce', 'ethereum')?.category).toBe('infrastructure');
+    expect(lookupLabel('0x5754284f345afc66a98fbB0a0Afe71e0F007B949', 'ethereum')?.category).toBe('other');
+    expect(lookupLabel('0x0000000000A39bb272e79075ade125fd351887Ac', 'ethereum')?.name).toBe('Blur: Pool');
+    // Exchange attributions we could not verify to the wallet number are unnumbered.
+    expect(lookupLabel('0x742d35Cc6634C0532925a3b844Bc454e4438f44e', 'ethereum')?.name).toBe('Bitfinex');
+    expect(lookupLabel('0x53d284357ec70cE289D6D64134DfAc8E511c8a3D', 'ethereum')?.name).toBe('Kraken (hot wallet)');
+    // Dropped: the Solana "Coinbase" wallet could not be verified.
+    expect(lookupLabel('H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS', 'solana')).toBeUndefined();
+  });
+
+  it('scopes contracts that share an address on only some chains to exactly those chains', () => {
+    for (const chain of ['ethereum', 'arbitrum', 'optimism', 'polygon']) {
+      expect(lookupLabel(UNI_V3_FACTORY, chain)?.name, chain).toBe('Uniswap V3: Factory');
+      expect(lookupLabel('0xC36442b4a4522E871399CD717aBDD847Ab11FE88', chain)?.name, chain).toMatch(/Positions NFT/);
+      expect(lookupLabel('0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD', chain)?.name, chain).toMatch(/Universal Router/);
+    }
+    for (const chain of ['base', 'bsc', 'avalanche', 'zksync', 'celo']) {
+      expect(lookupLabel(UNI_V3_FACTORY, chain), chain).toBeUndefined();
+      expect(lookupLabel('0xC36442b4a4522E871399CD717aBDD847Ab11FE88', chain), chain).toBeUndefined();
+    }
+    expect(lookupLabel('0x33128a8fC17869897dcE68Ed026d694621f6FDfD', 'base')?.name).toBe('Uniswap V3: Factory');
+    expect(lookupLabel('0x33128a8fC17869897dcE68Ed026d694621f6FDfD', 'ethereum')).toBeUndefined();
+    expect(lookupLabel('0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD', 'base')?.name).toMatch(/Universal Router/);
+    expect(lookupLabel('0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD', 'bsc')).toBeUndefined();
+
+    expect(lookupLabel(CELER, 'ethereum')?.name).toMatch(/cBridge/);
+    expect(lookupLabel(CELER, 'polygon')).toBeUndefined();
+    expect(lookupLabel(ZKEVM_BRIDGE, 'ethereum')?.name).toMatch(/zkEVM/);
+    expect(lookupLabel(ZKEVM_BRIDGE, 'polygon-zkevm')?.name).toMatch(/zkEVM/);
+    expect(lookupLabel(ZKEVM_BRIDGE, 'bsc')).toBeUndefined();
+    expect(lookupLabel(CBBTC, 'ethereum')?.name).toMatch(/cbBTC/);
+    expect(lookupLabel(CBBTC, 'base')?.name).toMatch(/cbBTC/);
+    expect(lookupLabel(CBBTC, 'polygon')).toBeUndefined();
+  });
+
+  it('keeps canonical infrastructure off zkSync Era, where it lives at other addresses', () => {
+    for (const addr of [MULTICALL3, '0x000000000022D473030F116dDEE9F6B43aC78BA3', '0x4e59b44847b379578588920cA78FbF26c0B4956C', '0xa6B71E26C5e0845f74c812102Ca7114b6a896AB2', '0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552']) {
+      expect(lookupLabel(addr, 'zksync'), addr).toBeUndefined();
+      for (const chain of EVM_CHAINS.filter((c) => c !== 'zksync')) expect(lookupLabel(addr, chain), `${addr} on ${chain}`).toBeDefined();
+      expect(lookupLabel(addr, 'bitcoin'), addr).toBeUndefined();
+      expect(lookupLabel(addr, 'solana'), addr).toBeUndefined();
+      expect(lookupLabel(addr), addr).toBeDefined();
+    }
   });
 });
 
@@ -101,14 +170,14 @@ describe('lookupLabel', () => {
   });
 
   it("matches 'evm'-scoped labels on every EVM chain but not on bitcoin/solana", () => {
-    for (const chain of ['ethereum', 'base', 'arbitrum', 'bsc', 'polygon', 'sepolia', 'evm']) {
-      expect(lookupLabel(MULTICALL3, chain)?.name, chain).toMatch(/Multicall3/);
+    for (const chain of [...EVM_CHAINS, 'evm']) {
+      expect(lookupLabel(DEAD_ADDR, chain)?.name, chain).toMatch(/0xdead/);
       expect(lookupLabel(NULL_ADDR, chain)?.category, chain).toBe('burn');
     }
-    expect(lookupLabel(MULTICALL3, 'bitcoin')).toBeUndefined();
-    expect(lookupLabel(MULTICALL3, 'solana')).toBeUndefined();
-    expect(lookupLabel(MULTICALL3, 'not-a-chain')).toBeUndefined();
-    expect(lookupLabel(MULTICALL3)).toBeDefined();
+    expect(lookupLabel(DEAD_ADDR, 'bitcoin')).toBeUndefined();
+    expect(lookupLabel(DEAD_ADDR, 'solana')).toBeUndefined();
+    expect(lookupLabel(DEAD_ADDR, 'not-a-chain')).toBeUndefined();
+    expect(lookupLabel(DEAD_ADDR)).toBeDefined();
   });
 
   it("matches 'any'-scoped labels everywhere", () => {
@@ -151,11 +220,15 @@ describe('registerLabels override order', () => {
   });
 
   it('lets a case label override a builtin label with a different scope', () => {
-    // builtin Multicall3 is 'evm'-scoped; a chain-specific case tag wins on that chain.
-    registerLabels([caseLabel(MULTICALL3, 'My tag', 'base')]);
-    expect(lookupLabel(MULTICALL3, 'base')?.name).toBe('My tag');
+    // builtin 0xdead is 'evm'-scoped; a chain-specific case tag wins on that chain.
+    registerLabels([caseLabel(DEAD_ADDR, 'My tag', 'base')]);
+    expect(lookupLabel(DEAD_ADDR, 'base')?.name).toBe('My tag');
+    expect(lookupLabel(DEAD_ADDR, 'ethereum')?.name).toMatch(/0xdead/);
+    expect(lookupLabel(DEAD_ADDR)?.name).toBe('My tag');
+    // builtin Multicall3 has one entry per chain; a case tag on one chain beats it there only.
+    registerLabels([caseLabel(MULTICALL3, 'Chain tag', 'base')]);
+    expect(lookupLabel(MULTICALL3, 'base')?.name).toBe('Chain tag');
     expect(lookupLabel(MULTICALL3, 'ethereum')?.name).toMatch(/Multicall3/);
-    expect(lookupLabel(MULTICALL3)?.name).toBe('My tag');
     // builtin ethereum-scoped Binance 14 vs an 'evm'-scoped case tag: case still wins.
     registerLabels([caseLabel(BINANCE_14, 'Broad tag', 'evm')]);
     expect(lookupLabel(BINANCE_14, 'ethereum')?.name).toBe('Broad tag');

@@ -196,6 +196,7 @@ the UI. The authoritative list is published by [OFAC](https://ofac.treasury.gov/
 - **Risk heuristics** — `src/lib/intel/risk.ts`, pure functions over data already fetched.
 - **Known selectors / Solana programs / SPL mints** — small tables in the providers.
 - **Cases and notes** — `localStorage` under `loxdetective.cases.v1`.
+- **Recent searches** — `localStorage` under `loxdetective.recent.v1` (at most 10 entries; cleared via Settings → clear caches).
 
 ## 11. Outbound links only (no API calls)
 

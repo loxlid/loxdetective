@@ -23,6 +23,11 @@ export function detectInput(rawInput: string): DetectedInput {
     return { kind: 'evm-address', value, families: ['evm'], hint: 'EVM address (checked on every supported chain)' };
   }
 
+  if (/^[0-9a-fA-F]{40}$/.test(input)) {
+    // Bare 40-hex: an EVM address pasted without its prefix (the same leniency HEX32 gives hashes).
+    return { kind: 'evm-address', value: getAddress(`0x${input}`), families: ['evm'], hint: 'EVM address (0x prefix added)' };
+  }
+
   if (HEX32.test(input)) {
     const value = input.startsWith('0x') ? input.toLowerCase() : input.toLowerCase();
     if (value.startsWith('0x')) {

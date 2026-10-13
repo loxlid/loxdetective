@@ -38,6 +38,12 @@ export interface FetchJsonOptions {
   /** Number of attempts against the same URL (default 1). */
   retries?: number;
   signal?: AbortSignal;
+  /**
+   * Quote bare integers of 16+ digits in the response body before `JSON.parse`
+   * so values above 2^53 (lamport balances, u64 counters) keep their precision
+   * as digit strings instead of silently rounding to a double.
+   */
+  quoteBigInts?: boolean;
 }
 
 const DEFAULT_TIMEOUT = 15_000;
@@ -61,6 +67,69 @@ function withTimeout(signal: AbortSignal | undefined, ms: number): { signal: Abo
 
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** Strip API keys from a URL before it goes into an error message or log. */
+export function redactUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    for (const k of [...u.searchParams.keys()]) if (/api[-_]?key|token|secret/i.test(k)) u.searchParams.set(k, 'REDACTED');
+    return u.toString();
+  } catch {
+    return url.split('?')[0];
+  }
+}
+
+const BIG_INT_DIGITS = 16;
+
+/**
+ * Wrap every bare JSON integer of {@link BIG_INT_DIGITS}+ digits (outside
+ * string literals) in double quotes. Decimals and exponents are left alone;
+ * string contents are never touched, so `"log: 12345678901234567,"` survives.
+ */
+export function quoteBigInts(text: string): string {
+  let out = '';
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    if (ch === '"') {
+      // Copy the whole string literal verbatim, honouring escapes.
+      let j = i + 1;
+      while (j < n) {
+        if (text[j] === '\\') j += 2;
+        else if (text[j] === '"') {
+          j++;
+          break;
+        } else j++;
+      }
+      out += text.slice(i, j);
+      i = j;
+      continue;
+    }
+    if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      let j = i;
+      if (text[j] === '-') j++;
+      const digitsStart = j;
+      while (j < n && text[j] >= '0' && text[j] <= '9') j++;
+      const digits = j - digitsStart;
+      let isInteger = true;
+      if (j < n && (text[j] === '.' || text[j] === 'e' || text[j] === 'E')) {
+        isInteger = false;
+        // Consume the fraction / exponent so its digits are not re-scanned.
+        while (j < n && /[0-9.eE+-]/.test(text[j])) j++;
+      }
+      const token = text.slice(i, j);
+      const next = j < n ? text[j] : '';
+      const terminated = next === '' || next === ',' || next === ']' || next === '}' || /\s/.test(next);
+      out += isInteger && digits >= BIG_INT_DIGITS && terminated ? `"${token}"` : token;
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 /** Fetch a URL and parse JSON, throwing HttpError on non-2xx. */
 export async function fetchJson<T = unknown>(url: string, opts: FetchJsonOptions = {}): Promise<T> {
   const attempts = Math.max(1, opts.retries ?? 1);
@@ -82,13 +151,14 @@ export async function fetchJson<T = unknown>(url: string, opts: FetchJsonOptions
       let parsed: unknown = undefined;
       if (text) {
         try {
-          parsed = JSON.parse(text);
+          parsed = JSON.parse(opts.quoteBigInts ? quoteBigInts(text) : text);
         } catch {
           parsed = text;
         }
       }
       if (!res.ok) {
-        throw new HttpError(`HTTP ${res.status} from ${url}`, res.status, url, parsed);
+        const safe = redactUrl(url);
+        throw new HttpError(`HTTP ${res.status} from ${safe}`, res.status, safe, parsed);
       }
       return parsed as T;
     } catch (err) {
@@ -149,10 +219,14 @@ export async function jsonRpc<T = unknown>(
     method: 'POST',
     body: req,
   });
-  if (res && typeof res === 'object' && res.error) {
+  if (!res || typeof res !== 'object' || Array.isArray(res) || !('result' in res || 'error' in res)) {
+    // 2xx with HTML/text/empty body (challenge page, proxy error): not a usable answer, let the caller fall back.
+    throw new RpcError(`Malformed JSON-RPC response from ${redactUrl(url)}`, undefined, res);
+  }
+  if (res.error) {
     throw new RpcError(res.error.message || 'RPC error', res.error.code, res.error.data);
   }
-  return (res as { result: T }).result;
+  return res.result as T;
 }
 
 /** Batched JSON-RPC call; returns results in request order (errors become RpcError instances). */

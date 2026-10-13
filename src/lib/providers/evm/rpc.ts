@@ -469,7 +469,9 @@ export async function erc20Meta(chain: ChainInfo, token: string, signal?: AbortS
     try {
       return await ethCall(chain, token, encodeFunctionData({ abi: ERC20_ABI, functionName }), signal);
     } catch (err) {
-      if (err instanceof RpcError && !isAbortError(err, signal)) return undefined;
+      // Only reverts / absent functions mean "no metadata"; transient errors (rate limits,
+      // missing trie nodes, malformed responses) must propagate so nothing bogus gets cached.
+      if (isDeterministicRpcError(err)) return undefined;
       throw err;
     }
   };

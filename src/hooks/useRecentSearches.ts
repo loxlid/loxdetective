@@ -30,13 +30,20 @@ function storage(): Storage | undefined {
   }
 }
 
+/** Only in-app routes may be stored as `path` (it is rendered as a Link href). */
+function isAppPath(p: string): boolean {
+  return p.startsWith('/') && !p.startsWith('//');
+}
+
 function isRecent(v: unknown): v is RecentSearch {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<RecentSearch>;
   return (
-    typeof v === 'object' &&
-    v !== null &&
-    typeof (v as RecentSearch).query === 'string' &&
-    typeof (v as RecentSearch).kind === 'string' &&
-    typeof (v as RecentSearch).at === 'number'
+    typeof r.query === 'string' &&
+    typeof r.kind === 'string' &&
+    typeof r.at === 'number' &&
+    (r.chain === undefined || typeof r.chain === 'string') &&
+    (r.path === undefined || (typeof r.path === 'string' && isAppPath(r.path)))
   );
 }
 

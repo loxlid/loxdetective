@@ -272,7 +272,7 @@ export async function getTransactionFull(chain: ChainInfo, hash: string, signal?
     blockNumber !== undefined ? blockTimestamp(chain, blockNumber, signal) : undefined,
     bs ? optional(blockscout.txSummary(chain, hash, signal), signal) : undefined,
     bs ? optional(blockscout.txTokenTransfers(chain, hash, signal), signal) : undefined,
-    bs ? optional(blockscout.txInternal(chain, hash, signal), signal) : undefined,
+    bs ? optional(blockscout.txInternalPaged(chain, hash, signal), signal) : undefined,
   ]);
 
   const rawLogs: RawEvmLog[] = receipt?.logs ?? [];
@@ -307,6 +307,7 @@ export async function getTransactionFull(chain: ChainInfo, hash: string, signal?
   if (tx.maxPriorityFeePerGas) extra.maxPriorityFeePerGas = hexToBigIntSafe(tx.maxPriorityFeePerGas).toString();
   if (receipt?.l1Fee) extra.l1Fee = l1Fee.toString();
   if (receipt?.logs) extra.logCount = receipt.logs.length;
+  if (bsInternal?.truncated) extra.internalTruncated = true;
 
   return {
     chain: chain.id,
@@ -327,7 +328,7 @@ export async function getTransactionFull(chain: ChainInfo, hash: string, signal?
     methodName,
     contractCreated: receipt?.contractAddress ?? summary?.contractCreated,
     transfers,
-    internal: bsInternal,
+    internal: bsInternal?.calls,
     logs,
     extra,
   };
@@ -390,8 +391,10 @@ function padTopicAddress(address: string): string {
  * only explorer-independent source is `eth_getLogs` on the RPC: topic0 ∈
  * {Approval, ApprovalForAll} with topics[1] = the owner, over the last
  * ~2,000,000 blocks. Public RPCs disagree on the largest range they accept,
- * so one wide request is tried first; if it is refused the span is split into
- * 5 chunks, with a hard cap of 10 requests in total. Logs are deduplicated by
+ * so one wide request is tried first; if it is refused the span is split once
+ * into 5 chunks (a refused chunk fails fast rather than re-splitting, so a
+ * capped RPC costs at most 2 eth_getLogs calls), with a hard cap of 10
+ * requests in total. Logs are deduplicated by
  * (token, spender) keeping the latest, zero allowances (revocations) are
  * dropped and token metadata comes from `erc20Meta`. On chains whose RPCs
  * refuse large log queries this returns `[]` with a console warning rather
@@ -403,7 +406,7 @@ export async function getApprovals(chain: ChainInfo, address: string, signal?: A
   const topics = [[TOPIC_APPROVAL, TOPIC_APPROVAL_FOR_ALL], padTopicAddress(address)];
   let requests = 0;
 
-  const fetchRange = async (from: number, to: number): Promise<RawEvmLog[]> => {
+  const fetchRange = async (from: number, to: number, depth = 0): Promise<RawEvmLog[]> => {
     if (requests >= APPROVAL_MAX_REQUESTS) throw new Error('eth_getLogs request budget exhausted');
     requests++;
     try {
@@ -411,11 +414,13 @@ export async function getApprovals(chain: ChainInfo, address: string, signal?: A
     } catch (err) {
       if (isAbortError(err, signal)) throw err;
       const size = to - from + 1;
-      if (size < 1_000 || requests + APPROVAL_SPLIT > APPROVAL_MAX_REQUESTS) throw err;
+      // Single-level split only: a second level could never finish within the budget
+      // (its siblings would exhaust it and discard everything fetched so far).
+      if (depth > 0 || size < 1_000 || requests + APPROVAL_SPLIT > APPROVAL_MAX_REQUESTS) throw err;
       const step = Math.ceil(size / APPROVAL_SPLIT);
       const out: RawEvmLog[] = [];
       for (let start = from; start <= to; start += step) {
-        out.push(...(await fetchRange(start, Math.min(to, start + step - 1))));
+        out.push(...(await fetchRange(start, Math.min(to, start + step - 1), depth + 1)));
       }
       return out;
     }

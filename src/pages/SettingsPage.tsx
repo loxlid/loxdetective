@@ -29,7 +29,7 @@ type StoreSlice = Pick<AppSettings, 'customRpc' | 'etherscanApiKey' | 'alchemyAp
 /** Draft form state from the persisted settings (one textarea string per chain). */
 export function toDraft(s: StoreSlice): Draft {
   const rpc: Record<ChainId, string> = {};
-  for (const [id, urls] of Object.entries(s.customRpc ?? {})) rpc[id] = (urls ?? []).join('\n');
+  for (const [id, urls] of Object.entries(s.customRpc ?? {})) rpc[id] = Array.isArray(urls) ? urls.filter((u): u is string => typeof u === 'string').join('\n') : '';
   return {
     rpc,
     etherscanApiKey: s.etherscanApiKey ?? '',
@@ -38,6 +38,23 @@ export function toDraft(s: StoreSlice): Draft {
     showTestnets: s.showTestnets,
     enableSanctionsFeed: s.enableSanctionsFeed,
   };
+}
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** Plain-http endpoints that an https deployment cannot reach (mixed content); loopback hosts are allowed. */
+export function insecureRpcUrls(customRpc: Record<ChainId, string[]>): string[] {
+  return Object.values(customRpc)
+    .flat()
+    .filter((u) => {
+      if (!/^http:\/\//i.test(u)) return false;
+      try {
+        const h = new URL(u).hostname.toLowerCase();
+        return !(LOCAL_HOSTS.has(h) || h.endsWith('.localhost'));
+      } catch {
+        return true;
+      }
+    });
 }
 
 /** Parse the draft back into a settings patch; blank lines and non-http(s) URLs are dropped. */
@@ -126,7 +143,10 @@ export default function SettingsPage() {
   };
 
   const feedInfo = feed.data ? { fetchedAt: feed.fetchedAt, eth: feed.ethCount, btc: feed.btcCount } : sanctionsFeedInfo();
-  const customCount = Object.values(fromDraft(draft).customRpc).reduce((n, l) => n + l.length, 0);
+  const draftRpc = fromDraft(draft).customRpc;
+  const customCount = Object.values(draftRpc).reduce((n, l) => n + l.length, 0);
+  const insecureRpc = insecureRpcUrls(draftRpc);
+  const onHttps = typeof location !== 'undefined' && location.protocol === 'https:';
 
   return (
     <div className="settings-page" data-testid="settings-page">
@@ -211,6 +231,11 @@ export default function SettingsPage() {
       </div>
 
       <Card title="Custom RPC endpoints" subtitle={`One URL per line. Custom endpoints are tried first, then the built-in public ones. ${customCount ? `${customCount} custom endpoint${customCount === 1 ? '' : 's'} configured.` : ''}`}>
+        {onHttps && insecureRpc.length > 0 && (
+          <p className="field__hint" role="alert" data-testid="settings-rpc-insecure">
+            This site is served over https, so the browser blocks plain http:// endpoints (mixed content) and they will be skipped in favour of the public RPCs: {insecureRpc.join(', ')}. Use an https URL, a reverse proxy with TLS, or http://localhost.
+          </p>
+        )}
         <div className="rpc-grid">
           {chains.map((c) => (
             <label key={c.id} className="field rpc-field">

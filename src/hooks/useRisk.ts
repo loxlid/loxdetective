@@ -43,7 +43,16 @@ export function counterpartyLabels(chain: ChainId, rows: TxListItem[], self: str
 export function buildRiskInput(
   chain: ChainId,
   address: string,
-  parts: { summary?: ChainAddressSummary; history?: TxListItem[]; tokenTransfers?: TxListItem[]; approvals?: ApprovalInfo[]; nativePriceUsd?: number; now?: number },
+  parts: {
+    summary?: ChainAddressSummary;
+    history?: TxListItem[];
+    tokenTransfers?: TxListItem[];
+    approvals?: ApprovalInfo[];
+    /** True when the loaded history and token rows are the wallet's whole history (no further pages). */
+    historyComplete?: boolean;
+    nativePriceUsd?: number;
+    now?: number;
+  },
 ): RiskInput {
   const rows = [...(parts.history ?? []), ...(parts.tokenTransfers ?? [])];
   return {
@@ -53,6 +62,7 @@ export function buildRiskInput(
     history: parts.history,
     tokenTransfers: parts.tokenTransfers,
     approvals: parts.approvals,
+    historyComplete: parts.historyComplete,
     counterpartyLabels: counterpartyLabels(chain, rows, address),
     nativePriceUsd: parts.nativePriceUsd,
     now: parts.now,
@@ -77,13 +87,15 @@ export function useRisk(chain: ChainId, address: string): RiskState {
   const history = txH.query.data?.pages[0]?.items;
   const tokenTransfers = tokenH.query.data?.pages[0]?.items;
   const approvals = approvalsQ.data;
+  // Only the first pages feed the assessment; tell the fresh-wallet check whether they are the whole history.
+  const historyComplete = txH.query.isSuccess && !txH.query.hasNextPage && (!tokenH.supported || (tokenH.query.isSuccess && !tokenH.query.hasNextPage));
 
   const report = useMemo(() => {
     if (!info) return undefined;
     if (!summary && !history) return undefined;
-    return assessAddress(buildRiskInput(chain, summary?.address ?? address, { summary, history, tokenTransfers, approvals, nativePriceUsd }));
+    return assessAddress(buildRiskInput(chain, summary?.address ?? address, { summary, history, tokenTransfers, approvals, historyComplete, nativePriceUsd }));
     // `rev` re-runs the assessment when labels change (feed load, case tags).
-  }, [info, chain, address, summary, history, tokenTransfers, approvals, nativePriceUsd, rev]);
+  }, [info, chain, address, summary, history, tokenTransfers, approvals, historyComplete, nativePriceUsd, rev]);
 
   const errors = [summaryQ.error, txH.error, tokenH.error, approvalsQ.error].filter((e): e is Error => !!e);
   const loading = summaryQ.isLoading || txH.isLoading || tokenH.isLoading || (approvalsQ.isLoading && info?.family === 'evm');

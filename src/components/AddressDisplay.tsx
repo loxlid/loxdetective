@@ -27,12 +27,12 @@ interface Props {
 }
 
 /** Placeholder values providers use for addresses that are not addresses. */
-const SPECIAL: Record<string, string> = {
-  coinbase: 'Coinbase (block reward)',
-  OP_RETURN: 'OP_RETURN (data output)',
-  unknown: 'Unknown',
-  '': '—',
-};
+const SPECIAL = new Map<string, string>([
+  ['coinbase', 'Coinbase (block reward)'],
+  ['OP_RETURN', 'OP_RETURN (data output)'],
+  ['unknown', 'Unknown'],
+  ['', '—'],
+]);
 
 const MAX_MULTI = 3;
 
@@ -42,7 +42,8 @@ const MAX_MULTI = 3;
  */
 export default function AddressDisplay({ address, chain, short = true, link = true, showLabel = true, labelOnly, copy = false, self, lead = 6, tail = 4, className }: Props) {
   const raw = (address ?? '').trim();
-  if (raw in SPECIAL) return <span className={`addr addr--special${className ? ` ${className}` : ''}`}>{SPECIAL[raw]}</span>;
+  const special = SPECIAL.get(raw);
+  if (special !== undefined) return <span className={`addr addr--special${className ? ` ${className}` : ''}`}>{special}</span>;
   if (raw.includes(',')) {
     const parts = raw.split(',').map((p) => p.trim()).filter(Boolean);
     return (

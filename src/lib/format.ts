@@ -16,8 +16,9 @@ export function formatAmount(raw: bigint, decimals: number, maxFraction = 6): st
   if (!frac || Number(frac) === 0) return intFmt;
   const trimmed = frac.slice(0, maxFraction).replace(/0+$/, '');
   if (!trimmed) {
-    // Value is below display precision but non-zero.
-    return `<${intFmt}.${'0'.repeat(Math.max(0, maxFraction - 1))}1`;
+    // Only a zero integer part is genuinely "below display precision"; otherwise show the truncated integer.
+    if (/^-?0$/.test(int)) return `<${intFmt}.${'0'.repeat(Math.max(0, maxFraction - 1))}1`;
+    return intFmt;
   }
   return `${intFmt}.${trimmed}`;
 }

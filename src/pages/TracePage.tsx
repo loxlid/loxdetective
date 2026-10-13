@@ -46,6 +46,7 @@ const MAX_PANEL_EDGES = 8;
 
 /** Parse a numeric input, clamped to a range; `fallback` when not a number. */
 export function clampInt(value: string, lo: number, hi: number, fallback: number): number {
+  if (value.trim() === '') return fallback;
   const n = Math.floor(Number(value));
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
 }
@@ -108,6 +109,9 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
   const toast = useToast();
   const rootLabel = useLabel(address, chain);
   const [form, setForm] = useState<TraceForm>(DEFAULT_TRACE_FORM);
+  // Numeric fields are kept as raw strings while editing and clamped on blur / run,
+  // so clearing the field and retyping does not snap to the minimum mid-keystroke.
+  const [draft, setDraft] = useState({ maxHops: String(DEFAULT_TRACE_FORM.maxHops), maxFanOut: String(DEFAULT_TRACE_FORM.maxFanOut) });
   const [graph, setGraph] = useState<FlowGraphData>();
   const [progress, setProgress] = useState('');
   const [running, setRunning] = useState(false);
@@ -133,6 +137,8 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
         address,
         {
           ...form,
+          maxHops: clampInt(draft.maxHops, HOPS_RANGE[0], HOPS_RANGE[1], DEFAULT_TRACE_FORM.maxHops),
+          maxFanOut: clampInt(draft.maxFanOut, FANOUT_RANGE[0], FANOUT_RANGE[1], DEFAULT_TRACE_FORM.maxFanOut),
           signal: controller.signal,
           onProgress: (msg, snapshot) => {
             if (controller.signal.aborted) return;
@@ -157,7 +163,7 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
     } finally {
       if (ctrl.current === controller) setRunning(false);
     }
-  }, [chain, address, form]);
+  }, [chain, address, form, draft]);
 
   const cancel = () => {
     ctrl.current?.abort();
@@ -176,6 +182,12 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
   const summary = useMemo(() => (graph ? summarizeGraph(graph) : undefined), [graph]);
   const selectedNode = graph && selected ? graph.nodes.find((n) => n.id === selected) : undefined;
   const update = <K extends keyof TraceForm>(key: K, value: TraceForm[K]) => setForm((f) => ({ ...f, [key]: value }));
+  const commitInt = (key: 'maxHops' | 'maxFanOut') => {
+    const [lo, hi] = key === 'maxHops' ? HOPS_RANGE : FANOUT_RANGE;
+    const v = clampInt(draft[key], lo, hi, DEFAULT_TRACE_FORM[key]);
+    update(key, v);
+    setDraft((d) => ({ ...d, [key]: String(v) }));
+  };
 
   return (
     <>
@@ -208,12 +220,12 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
         <div className="trace-form">
           <label className="field">
             <span className="field__label">Max hops</span>
-            <input className="input" type="number" min={HOPS_RANGE[0]} max={HOPS_RANGE[1]} value={form.maxHops} disabled={running} onChange={(e) => update('maxHops', clampInt(e.target.value, HOPS_RANGE[0], HOPS_RANGE[1], DEFAULT_TRACE_FORM.maxHops))} />
+            <input className="input" type="number" min={HOPS_RANGE[0]} max={HOPS_RANGE[1]} value={draft.maxHops} disabled={running} data-testid="trace-max-hops" onChange={(e) => setDraft((d) => ({ ...d, maxHops: e.target.value }))} onBlur={() => commitInt('maxHops')} />
             <span className="field__hint">1–4 hops from the root</span>
           </label>
           <label className="field">
             <span className="field__label">Fan-out per node</span>
-            <input className="input" type="number" min={FANOUT_RANGE[0]} max={FANOUT_RANGE[1]} value={form.maxFanOut} disabled={running} onChange={(e) => update('maxFanOut', clampInt(e.target.value, FANOUT_RANGE[0], FANOUT_RANGE[1], DEFAULT_TRACE_FORM.maxFanOut))} />
+            <input className="input" type="number" min={FANOUT_RANGE[0]} max={FANOUT_RANGE[1]} value={draft.maxFanOut} disabled={running} data-testid="trace-max-fanout" onChange={(e) => setDraft((d) => ({ ...d, maxFanOut: e.target.value }))} onBlur={() => commitInt('maxFanOut')} />
             <span className="field__hint">top counterparties expanded</span>
           </label>
           <label className="field">

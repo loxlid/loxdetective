@@ -482,8 +482,12 @@ const CSV_COLUMNS = [
 
 function csvCell(value: string | number | undefined): string {
   if (value === undefined) return '';
-  const s = String(value);
-  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  let s = String(value);
+  // Neutralise spreadsheet formula injection (CWE-1236): a text cell starting with
+  // = + - @ TAB CR is evaluated by Excel / LibreOffice. Numeric columns are left as-is.
+  const dangerous = typeof value === 'string' && /^[=+\-@\t\r]/.test(s);
+  if (dangerous) s = `'${s}`;
+  return dangerous || /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 function isoDate(ts: number | undefined): string {

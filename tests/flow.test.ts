@@ -477,6 +477,18 @@ describe('graphToCsv / graphToJson / summarizeGraph', () => {
     expect(ac).toContain(`${hash(2)};${hash(3)}`);
   });
 
+  it('graphToCsv neutralises spreadsheet formula injection in text cells only', async () => {
+    const injected = { [C]: { name: '=1+1', category: 'exchange' as const }, [D]: { name: '-foo', category: 'wallet' as const, source: 'case' }, [B]: { name: '@cmd', category: 'other' as const } };
+    const g = await trace(rows, { maxHops: 3, direction: 'both', stopAtLabelled: false }, makeProvider(rows, { labels: injected, prices: { native: 2000, [USDC.toLowerCase()]: 1 } }));
+    const csv = graphToCsv(g);
+    expect(csv).toContain('"\'=1+1"');
+    expect(csv).toContain('"\'-foo"');
+    expect(csv).toContain('"\'@cmd"');
+    expect(csv).not.toMatch(/(^|,)[=+\-@]/m);
+    const ac = csv.split('\n').find((l) => l.startsWith(`${displayAddress('ethereum', A)},,0,${displayAddress('ethereum', C)}`))!;
+    expect(ac).toContain(',2,2,6050.00,');
+  });
+
   it('graphToJson serialises bigints as strings in a versioned envelope', async () => {
     const g = await trace(rows, { maxHops: 1 }, provider());
     const parsed = JSON.parse(graphToJson(g)) as { format: string; version: number; graph: { edges: { transfers: { amount: { raw: string } }[] }[]; root: string } };
@@ -804,6 +816,61 @@ describe('FlowGraph component', () => {
       root.unmount();
     });
     expect(container.innerHTML).toBe('');
+    container.remove();
+  });
+
+  it('exposes nodes as keyboard-operable buttons with a single roving tab stop', async () => {
+    const rows: Row[] = [
+      { hash: hash(1), from: A, to: B, value: ETH(1) },
+      { hash: hash(2), from: A, to: C, value: ETH(2) },
+    ];
+    const graph = await trace(rows, { maxHops: 1, direction: 'out' }, makeProvider(rows, { prices: { native: 2000 } }));
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const onSelect = vi.fn();
+    await act(async () => {
+      root.render(createElement(FlowGraph, { graph, onSelect, height: 400 }));
+    });
+
+    expect(container.querySelector('svg.flowgraph__svg')?.getAttribute('role')).toBe('group');
+    const nodes = Array.from(container.querySelectorAll<SVGGElement>('g.flowgraph__node'));
+    expect(nodes).toHaveLength(graph.nodes.length);
+    for (const n of nodes) {
+      expect(n.getAttribute('role')).toBe('button');
+      expect(n.getAttribute('aria-label')).toBeTruthy();
+    }
+    const stops = nodes.filter((n) => n.getAttribute('tabindex') === '0');
+    expect(stops).toHaveLength(1);
+    expect(stops[0].classList.contains('is-root')).toBe(true);
+    expect(nodes.filter((n) => n.getAttribute('tabindex') === '-1')).toHaveLength(nodes.length - 1);
+
+    const rootNode = stops[0];
+    await act(async () => {
+      rootNode.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    });
+    expect(onSelect).toHaveBeenCalledWith(graph.root);
+
+    // Arrow keys move the tab stop to the next node without selecting it.
+    await act(async () => {
+      rootNode.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true, cancelable: true }));
+    });
+    const after = Array.from(container.querySelectorAll<SVGGElement>('g.flowgraph__node'));
+    expect(after.filter((n) => n.getAttribute('tabindex') === '0')).toHaveLength(1);
+    expect(rootNode.getAttribute('tabindex')).toBe('-1');
+    expect(onSelect).toHaveBeenCalledTimes(1);
+
+    // Selecting a node from outside makes it the tab stop.
+    await act(async () => {
+      root.render(createElement(FlowGraph, { graph, onSelect, selected: B, height: 400 }));
+    });
+    const selectedStops = Array.from(container.querySelectorAll<SVGGElement>('g.flowgraph__node')).filter((n) => n.getAttribute('tabindex') === '0');
+    expect(selectedStops).toHaveLength(1);
+    expect(selectedStops[0].classList.contains('is-selected')).toBe(true);
+
+    await act(async () => {
+      root.unmount();
+    });
     container.remove();
   });
 });

@@ -29,7 +29,7 @@ import { normalizePriceKeys, priceBalances, tokenPriceKey } from '@/hooks/usePri
 import { sortBalances } from '@/hooks/useTokenBalances';
 import { labelApprovals } from '@/hooks/useApprovals';
 import { buildRiskInput, counterpartyLabels } from '@/hooks/useRisk';
-import { toDraft, fromDraft } from '@/pages/SettingsPage';
+import { toDraft, fromDraft, insecureRpcUrls } from '@/pages/SettingsPage';
 import App from '@/App';
 import Layout from '@/components/Layout';
 import SearchBar, { searchPath } from '@/components/SearchBar';
@@ -337,6 +337,27 @@ describe('recent searches', () => {
     addRecentSearch({ query: 'x', kind: 'unknown' });
     expect(readRecentSearches().map((r) => r.query)).toEqual(['x']);
   });
+
+  it('drops persisted entries whose path is not an in-app route', async () => {
+    const good = { query: 'ok', kind: 'unknown', at: 1, path: `/address/ethereum/${VITALIK}` };
+    localStorage.setItem(
+      RECENT_SEARCHES_KEY,
+      JSON.stringify([
+        { query: 'js', kind: 'unknown', at: 4, path: 'javascript:alert(1)' },
+        { query: 'ext', kind: 'unknown', at: 3, path: '//evil.example/x' },
+        { query: 'abs', kind: 'unknown', at: 2, path: 'https://evil.example/x' },
+        { query: 'num', kind: 'unknown', at: 2, path: 5 },
+        { query: 'chain', kind: 'unknown', at: 2, chain: 7 },
+        good,
+        { query: 'nopath', kind: 'unknown', at: 0 },
+      ]),
+    );
+    // Fresh module instance so the in-memory cache is bypassed and storage is re-read.
+    vi.resetModules();
+    const fresh = await import('@/hooks/useRecentSearches');
+    expect(fresh.readRecentSearches()).toEqual([good, { query: 'nopath', kind: 'unknown', at: 0 }]);
+    vi.resetModules();
+  });
 });
 
 describe('theme', () => {
@@ -389,6 +410,19 @@ describe('settings drafts', () => {
     expect(back.showTestnets).toBe(true);
     expect(back.enableSanctionsFeed).toBe(false);
   });
+
+  it('toDraft tolerates malformed persisted customRpc values', () => {
+    const bad = { customRpc: { ethereum: 'https://x', base: ['https://ok', 5], bitcoin: null }, etherscanApiKey: undefined, alchemyApiKey: undefined, heliusApiKey: undefined, showTestnets: false, enableSanctionsFeed: true };
+    const draft = toDraft(bad as unknown as Parameters<typeof toDraft>[0]);
+    expect(draft.rpc.ethereum).toBe('');
+    expect(draft.rpc.base).toBe('https://ok');
+    expect(draft.rpc.bitcoin).toBe('');
+  });
+
+  it('insecureRpcUrls flags plain-http endpoints except loopback hosts', () => {
+    expect(insecureRpcUrls({ ethereum: ['http://10.0.0.5:8545', 'https://a', 'http://localhost:8545', 'http://127.0.0.1:8545', 'http://[::1]:8545', 'http://node.localhost'], base: ['HTTP://evil.example'] })).toEqual(['http://10.0.0.5:8545', 'HTTP://evil.example']);
+    expect(insecureRpcUrls({})).toEqual([]);
+  });
 });
 
 describe('risk / approvals helpers', () => {
@@ -411,6 +445,9 @@ describe('risk / approvals helpers', () => {
     const input = buildRiskInput('ethereum', ADDRESS, { history: rows, nativePriceUsd: 2500 });
     expect(input.counterpartyLabels?.size).toBe(1);
     expect(input.nativePriceUsd).toBe(2500);
+    expect(input.historyComplete).toBeUndefined();
+    expect(buildRiskInput('ethereum', ADDRESS, { history: rows, historyComplete: false }).historyComplete).toBe(false);
+    expect(buildRiskInput('ethereum', ADDRESS, { history: rows, historyComplete: true }).historyComplete).toBe(true);
   });
 });
 
@@ -449,6 +486,16 @@ describe('components', () => {
     const labelOnly = await render(<AddressDisplay address={USDC} chain="ethereum" labelOnly />);
     expect(labelOnly).not.toContain('0xA0b8…eB48');
     expect(labelOnly).toContain('USDC');
+  });
+
+  it('AddressDisplay does not treat Object.prototype keys as special placeholders', async () => {
+    for (const value of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      const html = await render(<AddressDisplay address={value} chain="ethereum" />);
+      expect(html).not.toContain('addr--special');
+      expect(html).toContain('addr__text');
+      expect(html).toContain(value);
+    }
+    expect(await render(<AddressDisplay address="unknown" chain="ethereum" />)).toContain('addr--special');
   });
 
   it('reflects case tags registered as labels', async () => {
@@ -594,6 +641,37 @@ describe('layout', () => {
     expect(count(other.html, 'data-testid="search-input"')).toBe(1);
     expect(other.container.querySelector<HTMLInputElement>('[data-testid="search-input"]')?.value).toBe('vitalik.eth');
     other.unmount();
+  });
+
+  it('skip link moves focus to the main region instead of navigating the router', async () => {
+    const m = await mount(
+      <Routes>
+        <Route
+          path="/about"
+          element={
+            <Layout>
+              <span data-testid="about-body">About body</span>
+            </Layout>
+          }
+        />
+        <Route path="*" element={<span data-testid="not-found">404</span>} />
+      </Routes>,
+      '/about',
+    );
+    const skip = m.container.querySelector<HTMLAnchorElement>('a.skip-link');
+    const main = m.container.querySelector<HTMLElement>('main#main');
+    expect(skip?.getAttribute('href')).toBe('#main');
+    expect(main?.getAttribute('tabindex')).toBe('-1');
+    const ev = new MouseEvent('click', { bubbles: true, cancelable: true });
+    let notPrevented = true;
+    await act(async () => {
+      notPrevented = skip!.dispatchEvent(ev);
+    });
+    expect(notPrevented).toBe(false);
+    expect(document.activeElement?.id).toBe('main');
+    expect(m.container.querySelector('[data-testid="about-body"]')).not.toBeNull();
+    expect(m.container.querySelector('[data-testid="not-found"]')).toBeNull();
+    m.unmount();
   });
 });
 

@@ -73,7 +73,7 @@ const EXTRA_LABELS: Record<string, string> = {
   error: 'Error',
 };
 /** Extras that get their own section (or none) instead of a key/value row. */
-const HIDDEN_EXTRAS = new Set(['logMessages', 'logTruncated', 'error']);
+const HIDDEN_EXTRAS = new Set(['logMessages', 'logTruncated', 'internalTruncated', 'error']);
 
 /** Human label for an `extra` key: known names first, else "camelCase" → "Camel case". */
 export function extraLabel(key: string): string {
@@ -98,7 +98,7 @@ export function buildTxStats(tx: Transaction, info: ChainInfo, nativePrice: numb
   const fromPseudo = PSEUDO_ADDRESSES.has(tx.from);
   stats.push({
     label: 'From',
-    value: <AddressDisplay address={tx.from} chain={chain} short={false} copy={!fromPseudo} />,
+    value: <AddressDisplay address={tx.from} chain={chain} lead={10} tail={8} copy={!fromPseudo} />,
     hint: info.family === 'bitcoin' && !fromPseudo ? 'largest input' : info.family === 'solana' ? 'fee payer' : undefined,
   });
   if (tx.contractCreated) {
@@ -106,7 +106,7 @@ export function buildTxStats(tx: Transaction, info: ChainInfo, nativePrice: numb
   } else {
     stats.push({
       label: 'To',
-      value: tx.to ? <AddressDisplay address={tx.to} chain={chain} short={false} copy={!PSEUDO_ADDRESSES.has(tx.to)} /> : '—',
+      value: tx.to ? <AddressDisplay address={tx.to} chain={chain} lead={10} tail={8} copy={!PSEUDO_ADDRESSES.has(tx.to)} /> : '—',
       hint: info.family === 'solana' ? 'main program' : info.family === 'bitcoin' ? 'largest output' : undefined,
     });
   }
@@ -250,7 +250,11 @@ function TxBody({ tx, info }: { tx: Transaction; info: ChainInfo }) {
         <TransfersTable tx={tx} chain={info} />
       </Card>
       {tx.internal && tx.internal.length > 0 && (
-        <Card title="Internal calls" subtitle={`${tx.internal.length} call${tx.internal.length === 1 ? '' : 's'} reported by the explorer`} flush>
+        <Card
+          title="Internal calls"
+          subtitle={ex.internalTruncated === true ? `first ${tx.internal.length} calls (explorer has more)` : `${tx.internal.length} call${tx.internal.length === 1 ? '' : 's'} reported by the explorer`}
+          flush
+        >
           <InternalCallsTable calls={tx.internal} chain={info} />
         </Card>
       )}

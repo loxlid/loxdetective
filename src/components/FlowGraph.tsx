@@ -284,14 +284,16 @@ export default function FlowGraph({ graph, onSelect, selected, height = DEFAULT_
       const rect = canvasEl.getBoundingClientRect();
       return { x: event.clientX - rect.left + 14, y: event.clientY - rect.top + 14 };
     };
-    const nodeTip = (d: SimNode, event: MouseEvent): Tooltip => {
+    const nodeTipLines = (d: SimNode): Pick<Tooltip, 'title' | 'lines'> => {
       const n = d.node;
       const lines = [displayAddress(chain, n.id)];
       if (n.label) lines.push(`${n.label.category} · ${n.label.source}`);
       lines.push(`hop ${n.depth}${n.isContract ? ' · contract' : ''}${n.risk ? ` · risk ${n.risk}` : ''}`);
       lines.push(`in ${formatUsd(n.totalInUsd)} · out ${formatUsd(n.totalOutUsd)}`);
-      return { ...pointOf(event), title: nodeTitle(n, chain), lines };
+      return { title: nodeTitle(n, chain), lines };
     };
+    const nodeTip = (d: SimNode, event: MouseEvent): Tooltip => ({ ...pointOf(event), ...nodeTipLines(d) });
+    const isTabStop = (d: SimNode): boolean => d.id === (selectedRef.current ?? graph.root);
     const linkTip = (d: SimLink, event: MouseEvent): Tooltip => {
       const e = d.edge;
       const src = byId.get(e.source)?.node;
@@ -327,10 +329,34 @@ export default function FlowGraph({ graph, onSelect, selected, height = DEFAULT_
       .classed('is-root', (d) => d.id === graph.root)
       .classed('is-contract', (d) => !!d.node.isContract)
       .classed('is-selected', (d) => d.id === selectedRef.current)
+      // Keyboard access: the graph is one tab stop (roving tabindex); arrows move between nodes.
+      .attr('role', 'button')
+      .attr('aria-label', (d) => nodeTitle(d.node, chain))
+      .attr('tabindex', (d) => (isTabStop(d) ? 0 : -1))
       .on('click', (event: MouseEvent, d) => {
         event.stopPropagation();
         onSelectRef.current?.(d.id);
       })
+      .on('keydown', (event: KeyboardEvent, d) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onSelectRef.current?.(d.id);
+          return;
+        }
+        const step = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : event.key === 'ArrowLeft' || event.key === 'ArrowUp' ? -1 : 0;
+        if (!step || simNodes.length === 0) return;
+        event.preventDefault();
+        const i = simNodes.indexOf(d);
+        const next = simNodes[(i + step + simNodes.length) % simNodes.length];
+        node.attr('tabindex', (n) => (n === next ? 0 : -1));
+        node.filter((n) => n === next).node()?.focus();
+      })
+      .on('focus', (event: FocusEvent, d) => {
+        const r = (event.currentTarget as SVGGElement).getBoundingClientRect();
+        const c = canvasEl.getBoundingClientRect();
+        setTooltip({ ...nodeTipLines(d), x: r.right - c.left + 8, y: r.top - c.top });
+      })
+      .on('blur', () => setTooltip(null))
       .on('mouseenter', (event: MouseEvent, d) => setTooltip(nodeTip(d, event)))
       .on('mousemove', (event: MouseEvent) => setTooltip((t) => (t ? { ...t, ...pointOf(event) } : t)))
       .on('mouseleave', () => setTooltip(null));
@@ -418,7 +444,7 @@ export default function FlowGraph({ graph, onSelect, selected, height = DEFAULT_
       sim.stop();
       sim.on('tick', null).on('end', null);
       for (const n of simNodes) if (n.x !== undefined && n.y !== undefined) prev.set(n.id, { x: n.x, y: n.y });
-      node.on('.drag', null).on('click', null).on('mouseenter', null).on('mousemove', null).on('mouseleave', null);
+      node.on('.drag', null).on('click', null).on('keydown', null).on('focus', null).on('blur', null).on('mouseenter', null).on('mousemove', null).on('mouseleave', null);
       link.on('mouseenter', null).on('mousemove', null).on('mouseleave', null);
       if (simRef.current === sim) simRef.current = null;
     };
@@ -439,7 +465,10 @@ export default function FlowGraph({ graph, onSelect, selected, height = DEFAULT_
     const svgEl = svgRef.current;
     if (!svgEl) return;
     const svg = d3.select(svgEl);
-    svg.selectAll<SVGGElement, SimNode>('g.flowgraph__node').classed('is-selected', (d) => d.id === selected);
+    svg
+      .selectAll<SVGGElement, SimNode>('g.flowgraph__node')
+      .classed('is-selected', (d) => d.id === selected)
+      .attr('tabindex', (d) => (d.id === (selected ?? graph.root) ? 0 : -1));
     svg
       .selectAll<SVGPathElement, SimLink>('path.flowgraph__link')
       .classed('is-selected', (d) => !!selected && (d.edge.source === selected || d.edge.target === selected));
@@ -470,7 +499,7 @@ export default function FlowGraph({ graph, onSelect, selected, height = DEFAULT_
           width={width}
           height={height}
           viewBox={`0 0 ${width} ${height}`}
-          role="img"
+          role="group"
           aria-label={`Fund-flow graph with ${graph.nodes.length} addresses and ${graph.edges.length} edges`}
           onClick={() => setTooltip(null)}
         >

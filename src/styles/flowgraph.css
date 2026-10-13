@@ -81,6 +81,9 @@
   transition: stroke 120ms ease, stroke-width 120ms ease;
 }
 .flowgraph__node:hover circle { stroke: var(--text); }
+.flowgraph__node:focus { outline: none; }
+.flowgraph__node:focus-visible { outline: none; }
+.flowgraph__node:focus-visible circle { stroke: var(--accent); stroke-width: 3.5px; }
 .flowgraph__node.is-root circle { stroke: var(--accent-strong); stroke-width: 3px; }
 .flowgraph__node.is-selected circle { stroke: var(--text); stroke-width: 3.5px; }
 .flowgraph__node.is-contract circle { stroke-dasharray: 3 2; }

@@ -92,6 +92,15 @@ describe('btcDirection', () => {
     expect(btcDirection([io(ADDR, 50), io(ADDR, 50)], [io(ADDR, 99)], ADDR)).toEqual({ direction: 'self', net: -1n });
     expect(btcDirection([io(OTHER, 50)], [io(THIRD, 49)], ADDR).direction).toBe('unknown');
   });
+
+  it('treats an address-less non-OP_RETURN output as an external spend, but OP_RETURN as part of a consolidation', () => {
+    // Esplora omits scriptpubkey_address for p2pk / bare multisig / non-standard scripts.
+    expect(btcDirection([io(ADDR, 100)], [{ address: undefined, value: 60n, scriptType: 'p2pk' }, io(ADDR, 39)], ADDR)).toEqual({ direction: 'out', net: -61n });
+    expect(btcDirection([io(ADDR, 100)], [{ address: undefined, value: 60n, scriptType: 'multisig' }, io(ADDR, 39)], ADDR)).toEqual({ direction: 'out', net: -61n });
+    expect(btcDirection([io(ADDR, 100)], [{ address: undefined, value: 99n }, io(ADDR, 0)], ADDR).direction).toBe('out');
+    // Consolidation with an OP_RETURN marker stays 'self'.
+    expect(btcDirection([io(ADDR, 100)], [{ address: undefined, value: 0n, scriptType: 'op_return' }, io(ADDR, 99)], ADDR)).toEqual({ direction: 'self', net: -1n });
+  });
 });
 
 describe('btcTxToListItem', () => {
@@ -110,6 +119,20 @@ describe('btcTxToListItem', () => {
     expect(outgoing.from).toBe(ADDR);
     expect(outgoing.to).toBe(OTHER);
     expect(outgoing.value.raw).toBe(9_100n); // 10_000 spent - 900 change
+  });
+
+  it('labels a spend to an address-less output as outgoing with an unknown destination', () => {
+    const p2pk = btcTxToListItem(mkTx(txid(4), [{ addr: ADDR, value: 10_000 }], [{ value: 6_000, type: 'p2pk' }, { addr: ADDR, value: 3_900 }]), ADDR);
+    expect(p2pk.direction).toBe('out');
+    expect(p2pk.from).toBe(ADDR);
+    expect(p2pk.to).toBe('unknown');
+    expect(p2pk.value.raw).toBe(6_100n);
+
+    // A consolidation carrying only an OP_RETURN marker is still a self-transfer.
+    const consolidation = btcTxToListItem(mkTx(txid(5), [{ addr: ADDR, value: 10_000 }], [{ value: 0, type: 'op_return' }, { addr: ADDR, value: 9_900 }]), ADDR);
+    expect(consolidation.direction).toBe('self');
+    expect(consolidation.to).toBe(ADDR);
+    expect(consolidation.value.raw).toBe(100n);
   });
 
   it('handles coinbase and unconfirmed transactions', () => {

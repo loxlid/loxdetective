@@ -9,7 +9,6 @@
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint src tests e2e --ext .ts,.tsx",
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",

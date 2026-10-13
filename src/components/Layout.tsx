@@ -42,7 +42,17 @@ export default function Layout({ children }: { children: ReactNode }) {
 
   return (
     <div className="app">
-      <a className="skip-link" href="#main">
+      <a
+        className="skip-link"
+        href="#main"
+        onClick={(e) => {
+          // Under HashRouter a fragment navigation is a route change; move focus ourselves instead.
+          e.preventDefault();
+          const el = document.getElementById('main');
+          el?.focus();
+          el?.scrollIntoView?.();
+        }}
+      >
         Skip to content
       </a>
       <header className="nav">
@@ -70,7 +80,7 @@ export default function Layout({ children }: { children: ReactNode }) {
           </nav>
         </div>
       </header>
-      <main id="main" className="container page">
+      <main id="main" tabIndex={-1} className="container page">
         {children}
       </main>
       <footer className="footer">

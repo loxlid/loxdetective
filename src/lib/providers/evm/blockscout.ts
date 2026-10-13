@@ -56,6 +56,13 @@ interface BsTx {
   decoded_input?: { method_call?: string; method_id?: string } | null;
 }
 
+/** One `total` entry; ERC-1155 batch transfers carry an array of these. */
+interface BsTotal {
+  value?: string | null;
+  decimals?: string | number | null;
+  token_id?: string | null;
+}
+
 interface BsTokenTransfer {
   tx_hash?: string;
   transaction_hash?: string;
@@ -65,7 +72,7 @@ interface BsTokenTransfer {
   from?: BsAddressRef | null;
   to?: BsAddressRef | null;
   token?: BsToken | null;
-  total?: { value?: string | null; decimals?: string | number | null; token_id?: string | null } | null;
+  total?: BsTotal | BsTotal[] | null;
   method?: string | null;
   type?: string | null;
 }
@@ -307,12 +314,30 @@ function transferKind(type: TokenInfo['type'], tokenId: string | null | undefine
   return tokenId ? 'ERC-721' : 'ERC-20';
 }
 
-function tokenAmount(item: BsTokenTransfer, token: TokenInfo): { raw: bigint; decimals: number; symbol: string } {
-  const total = item.total;
+/** Normalise `total` (object, array for ERC-1155 batches, or missing) to a list. */
+function totalsOf(item: BsTokenTransfer): BsTotal[] {
+  const t = item.total;
+  return Array.isArray(t) ? t : t ? [t] : [];
+}
+
+function hasValue(total: BsTotal | undefined): total is BsTotal & { value: string } {
+  return total?.value !== undefined && total?.value !== null;
+}
+
+function tokenAmount(total: BsTotal | undefined, token: TokenInfo): { raw: bigint; decimals: number; symbol: string } {
   const isNft = token.type === 'ERC-721' || token.type === 'ERC-1155';
-  const raw = total?.value !== undefined && total?.value !== null ? toBigInt(total.value) : isNft ? 1n : 0n;
+  const raw = hasValue(total) ? toBigInt(total.value) : isNft ? 1n : 0n;
   const decimals = isNft ? 0 : (toNum(total?.decimals) ?? token.decimals);
   return { raw, decimals, symbol: token.symbol };
+}
+
+/** Aggregate amount of a transfer row: the sum over all `total` entries (ERC-1155 batches). */
+function rowAmount(item: BsTokenTransfer, token: TokenInfo): { raw: bigint; decimals: number; symbol: string } {
+  const totals = totalsOf(item);
+  if (totals.length <= 1) return tokenAmount(totals[0], token);
+  if (!totals.every(hasValue)) return tokenAmount(totals[0], token);
+  const first = tokenAmount(totals[0], token);
+  return { ...first, raw: totals.reduce((sum, t) => sum + toBigInt(t.value), 0n) };
 }
 
 function mapTokenTransferRow(chain: ChainInfo, item: BsTokenTransfer, address: string): TxListItem {
@@ -327,8 +352,8 @@ function mapTokenTransferRow(chain: ChainInfo, item: BsTokenTransfer, address: s
     decimals: 0,
     type: 'unknown' as const,
   };
-  const amount = tokenAmount(item, token);
-  const kind = transferKind(token.type, item.total?.token_id);
+  const amount = rowAmount(item, token);
+  const kind = transferKind(token.type, totalsOf(item)[0]?.token_id);
   return {
     chain: chain.id,
     hash: item.tx_hash ?? item.transaction_hash ?? '',
@@ -344,20 +369,21 @@ function mapTokenTransferRow(chain: ChainInfo, item: BsTokenTransfer, address: s
   };
 }
 
-function mapTransfer(chain: ChainInfo, item: BsTokenTransfer): Transfer | undefined {
+/** One `Transfer` per `total` entry (an ERC-1155 batch yields several sharing from/to/token/index). */
+function mapTransfer(chain: ChainInfo, item: BsTokenTransfer): Transfer[] {
   const token = mapToken(chain, item.token);
-  if (!token) return undefined;
-  const amount = tokenAmount(item, token);
-  const kind = transferKind(token.type, item.total?.token_id);
-  return {
-    kind,
+  if (!token) return [];
+  const totals = totalsOf(item);
+  const entries: (BsTotal | undefined)[] = totals.length > 0 ? totals : [undefined];
+  return entries.map((e) => ({
+    kind: transferKind(token.type, e?.token_id),
     from: checksum(item.from?.hash) ?? '',
     to: checksum(item.to?.hash) ?? '',
-    amount,
+    amount: tokenAmount(e, token),
     token,
-    tokenId: item.total?.token_id ?? undefined,
+    tokenId: e?.token_id ?? undefined,
     index: toNum(item.log_index),
-  };
+  }));
 }
 
 function mapInternalRow(chain: ChainInfo, item: BsInternalTx, address: string): TxListItem {
@@ -486,14 +512,32 @@ export async function addressInternalTxs(chain: ChainInfo, address: string, curs
   return { items: (res.items ?? []).map((i) => mapInternalRow(chain, i, address)), nextCursor: cursorFrom(res.next_page_params), source: SOURCE };
 }
 
+const MAX_INTERNAL_PAGES = 5;
+
+/**
+ * `/transactions/{h}/internal-transactions` is paginated (50 per page); follow
+ * up to 5 pages. `truncated` is true when the explorer still had more pages.
+ */
+export async function txInternalPaged(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<{ calls: InternalCall[]; truncated: boolean }> {
+  const calls: InternalCall[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_INTERNAL_PAGES; page++) {
+    const res = await get<BsPaged<BsInternalTx>>(chain, withCursor(`/transactions/${hash}/internal-transactions`, cursor), signal);
+    for (const i of res.items ?? []) calls.push(mapInternalCall(chain, i));
+    cursor = cursorFrom(res.next_page_params);
+    if (!cursor) return { calls, truncated: false };
+  }
+  return { calls, truncated: true };
+}
+
+/** Internal calls of a transaction (first {@link MAX_INTERNAL_PAGES} pages); see {@link txInternalPaged} for the truncation flag. */
 export async function txInternal(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<InternalCall[]> {
-  const res = await get<BsPaged<BsInternalTx>>(chain, `/transactions/${hash}/internal-transactions`, signal);
-  return (res.items ?? []).map((i) => mapInternalCall(chain, i));
+  return (await txInternalPaged(chain, hash, signal)).calls;
 }
 
 export async function txTokenTransfers(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<Transfer[]> {
   const res = await get<BsPaged<BsTokenTransfer>>(chain, `/transactions/${hash}/token-transfers`, signal);
-  return (res.items ?? []).map((i) => mapTransfer(chain, i)).filter((t): t is Transfer => t !== undefined);
+  return (res.items ?? []).flatMap((i) => mapTransfer(chain, i));
 }
 
 /** `/transactions/{h}`: method, fee, status, timestamp and the other top-level fields. */
