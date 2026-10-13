@@ -111,21 +111,11 @@ Block explorers show you *a* transaction. Investigations need the *story*: where
 
 ## Screenshots
 
-> Captured from the production build against the mocked network the e2e suite uses
-> (`npm run build && SCREENSHOTS=1 npx playwright test e2e/screenshots.spec.ts`), so they
-> show fixture data (1 ETH, one USDC transfer, empty history) rather than a live chain.
-
-| Home & universal search | Address profile |
-| --- | --- |
-| ![Home](docs/screenshots/home.png) | ![Address profile](docs/screenshots/address.png) |
-
-| Transaction decoding | Fund-flow tracer |
-| --- | --- |
-| ![Transaction](docs/screenshots/tx.png) | ![Trace](docs/screenshots/trace.png) |
-
-| Cases & notes | Settings |
-| --- | --- |
-| ![Cases](docs/screenshots/cases.png) | ![Settings](docs/screenshots/settings.png) |
+Screenshots are generated from the production build against the mocked network the
+e2e suite uses (`npm run build && SCREENSHOTS=1 npx playwright test e2e/screenshots.spec.ts`)
+and land in `docs/screenshots/` (home, address, tx, trace, cases, settings). They show fixture
+data rather than a live chain, so the quickest way to see the real thing is the
+[live demo](https://loxlid.github.io/loxdetective/).
 
 ## Supported networks
 
