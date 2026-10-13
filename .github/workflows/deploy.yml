@@ -63,6 +63,11 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # Try to switch Pages on for a repository that never enabled it. Works on
+          # repositories where GITHUB_TOKEN may enable Pages; otherwise enable it once
+          # under Settings → Pages → Source: GitHub Actions and re-run.
+          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
