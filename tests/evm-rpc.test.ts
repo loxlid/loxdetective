@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encodeAbiParameters, namehash, toFunctionSelector } from 'viem';
 import { CHAINS, getChain } from '@/lib/chains/registry';
 import { useSettings } from '@/lib/settings/store';
-import { RpcError } from '@/lib/http';
+import { clearEndpointCooldowns, isEndpointCooling, RpcError } from '@/lib/http';
 import {
   ENS_REGISTRY,
   decodeStringResult,
@@ -13,11 +13,14 @@ import {
   getBlock,
   getBlockNumber,
   getCode,
+  getLogs,
   getNativeBalance,
   getTransaction,
   getTransactionReceipt,
   lookupEnsName,
+  multiChainActivity,
   multiChainBalances,
+  PROBE_TIMEOUT_MS,
   resolveEns,
 } from '@/lib/providers/evm/rpc';
 
@@ -75,12 +78,53 @@ const chainOf = (url: string) => CHAINS.find((c) => c.rpcUrls.includes(url));
 
 beforeEach(() => {
   useSettings.getState().reset();
+  clearEndpointCooldowns();
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
+
+/** A fetch that never answers and only rejects once its signal is aborted (timeouts, cancellation). */
+function installHangingFetch() {
+  const fn = vi.fn(
+    (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+      }),
+  );
+  vi.stubGlobal('fetch', fn);
+  return fn;
+}
+
+/**
+ * Batch-aware fetch mock: `handler` answers one request at a time and the mock
+ * assembles the array response. Returning `HttpFailure` / `Error` from the
+ * handler fails the whole HTTP call; returning `{ single: ... }` replies with
+ * that object instead of an array (an endpoint without batch support).
+ */
+function installBatchFetch(handler: (url: string, req: RpcReq) => unknown) {
+  const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    const body = JSON.parse(String(init?.body)) as RpcReq | RpcReq[];
+    const reqs = Array.isArray(body) ? body : [body];
+    const outs: unknown[] = [];
+    for (const req of reqs) {
+      const out = await handler(url, req);
+      if (out instanceof Error) throw out;
+      if (out instanceof HttpFailure) return response({ message: 'boom' }, out.status);
+      if (out && typeof out === 'object' && 'single' in out) return response((out as { single: unknown }).single);
+      outs.push(out);
+    }
+    return response(Array.isArray(body) ? outs : outs[0]);
+  });
+  vi.stubGlobal('fetch', fn);
+  return fn;
+}
 
 // ---------------------------------------------------------------------------
 
@@ -200,6 +244,148 @@ describe('multiChainBalances', () => {
     expect(out[0].balance).toBe(5n);
     expect(out[1].error).toBeDefined();
     expect(out[2].balance).toBe(5n);
+  });
+});
+
+describe('multiChainActivity', () => {
+  it('runs balance + nonce as one JSON-RPC batch per chain and never rejects', async () => {
+    const fetchMock = installBatchFetch((url, req) => {
+      const chain = chainOf(url);
+      if (chain?.id === 'base') return new HttpFailure(500);
+      if (req.method === 'eth_getBalance') return ok(req, '0xde0b6b3a7640000');
+      if (req.method === 'eth_getTransactionCount') return ok(req, '0x2a');
+      return rpcError(req, -32601, 'method not found');
+    });
+    const out = await multiChainActivity([ETH, BASE, ARB], OWNER);
+    expect(out.map((a) => a.chain)).toEqual(['ethereum', 'base', 'arbitrum']);
+    expect(out[0]).toEqual({ chain: 'ethereum', balance: { chain: 'ethereum', balance: 10n ** 18n, decimals: 18, symbol: 'ETH' }, txCount: 42 });
+    expect(out[1].balance).toBeUndefined();
+    expect(out[1].txCount).toBeUndefined();
+    expect(out[1].error).toMatch(/HTTP 500/);
+    expect(out[2]).toMatchObject({ chain: 'arbitrum', txCount: 42 });
+    expect(out[2].balance?.balance).toBe(10n ** 18n);
+
+    // One POST per healthy chain, carrying both calls in request order.
+    const ethCalls = fetchMock.mock.calls.filter((c) => String(c[0]) === ETH.rpcUrls[0]);
+    expect(ethCalls).toHaveLength(1);
+    const body = JSON.parse(String(ethCalls[0][1]?.body)) as RpcReq[];
+    expect(body.map((r) => r.method)).toEqual(['eth_getBalance', 'eth_getTransactionCount']);
+    expect(body.map((r) => r.params)).toEqual([[OWNER, 'latest'], [OWNER, 'latest']]);
+  });
+
+  it('falls back to the next endpoint when one does not support batches, without cooling it down', async () => {
+    const fetchMock = installBatchFetch((url, req) => {
+      if (url === ETH.rpcUrls[0]) return { single: { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'batch requests are not supported' } } };
+      if (req.method === 'eth_getBalance') return ok(req, '0x5');
+      return ok(req, '0x1');
+    });
+    const [eth] = await multiChainActivity([ETH], OWNER);
+    expect(eth).toEqual({ chain: 'ethereum', balance: { chain: 'ethereum', balance: 5n, decimals: 18, symbol: 'ETH' }, txCount: 1 });
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([ETH.rpcUrls[0], ETH.rpcUrls[1]]);
+    expect(isEndpointCooling(ETH.rpcUrls[0])).toBe(false);
+  });
+
+  it('treats a null / empty batch body as a missing response, falls back and cools no endpoint down', async () => {
+    const fetchMock = installBatchFetch((url, req) => {
+      if (url === ETH.rpcUrls[0]) return { single: null };
+      if (req.method === 'eth_getBalance') return ok(req, '0x5');
+      return ok(req, '0x1');
+    });
+    const [eth] = await multiChainActivity([ETH], OWNER);
+    expect(eth).toEqual({ chain: 'ethereum', balance: { chain: 'ethereum', balance: 5n, decimals: 18, symbol: 'ETH' }, txCount: 1 });
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([ETH.rpcUrls[0], ETH.rpcUrls[1]]);
+    expect(isEndpointCooling(ETH.rpcUrls[0])).toBe(false);
+
+    // Every endpoint answering null: the RpcError message is reported, nothing crashes, nothing cools down.
+    clearEndpointCooldowns();
+    installBatchFetch(() => ({ single: null }));
+    const [again] = await multiChainActivity([ETH], OWNER);
+    expect(again).toEqual({ chain: 'ethereum', error: 'missing batch response' });
+    for (const u of ETH.rpcUrls) expect(isEndpointCooling(u)).toBe(false);
+  });
+
+  it('keeps a partial answer and explains the missing half', async () => {
+    installBatchFetch((_url, req) => (req.method === 'eth_getBalance' ? ok(req, '0x7') : rpcError(req, -32000, 'nonce unavailable')));
+    const [eth] = await multiChainActivity([ETH], OWNER);
+    expect(eth.balance?.balance).toBe(7n);
+    expect(eth.txCount).toBeUndefined();
+    expect(eth.error).toMatch(/eth_getTransactionCount: nonce unavailable/);
+  });
+
+  it('reports the last error when every endpoint fails', async () => {
+    installBatchFetch(() => new TypeError('network down'));
+    const [eth] = await multiChainActivity([ETH], OWNER);
+    expect(eth).toEqual({ chain: 'ethereum', error: 'network down' });
+    for (const u of ETH.rpcUrls) expect(isEndpointCooling(u)).toBe(true);
+  });
+
+  it('gives up on an endpoint after PROBE_TIMEOUT_MS', async () => {
+    vi.useFakeTimers();
+    expect(PROBE_TIMEOUT_MS).toBe(6_000);
+    const fetchMock = installHangingFetch();
+    const p = multiChainActivity([ETH], OWNER);
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * ETH.rpcUrls.length + 10);
+    const [eth] = await p;
+    expect(eth.error).toMatch(/timeout after 6000ms/);
+    expect(fetchMock).toHaveBeenCalledTimes(ETH.rpcUrls.length);
+  });
+});
+
+describe('probe timeouts', () => {
+  it('multiChainBalances times out each request after PROBE_TIMEOUT_MS', async () => {
+    vi.useFakeTimers();
+    installHangingFetch();
+    const p = multiChainBalances([ETH], OWNER);
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * ETH.rpcUrls.length + 10);
+    const [eth] = await p;
+    expect(eth.balance).toBe(0n);
+    expect(eth.error).toMatch(/timeout after 6000ms/);
+  });
+
+  it('findTxChain resolves null once every probe has timed out', async () => {
+    vi.useFakeTimers();
+    installHangingFetch();
+    const p = findTxChain([ETH], TX_HASH);
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * ETH.rpcUrls.length + 10);
+    await expect(p).resolves.toBeNull();
+  });
+
+  it('getNativeBalance keeps the longer default timeout', async () => {
+    vi.useFakeTimers();
+    installHangingFetch();
+    let settled = false;
+    const p = getNativeBalance(ETH, OWNER).then((b) => {
+      settled = true;
+      return b;
+    });
+    await vi.advanceTimersByTimeAsync(PROBE_TIMEOUT_MS * ETH.rpcUrls.length + 10);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(12_000 * ETH.rpcUrls.length);
+    const b = await p;
+    expect(b.error).toMatch(/timeout after 12000ms/);
+  });
+});
+
+describe('endpoint cooldown in rpcCall', () => {
+  it('skips an endpoint that just failed and tries it again only as a last resort', async () => {
+    const fetchMock = installFetch((url, req) => (url === ETH.rpcUrls[0] ? new HttpFailure(503) : ok(req, '0x1')));
+    await expect(getBlockNumber(ETH)).resolves.toBe(1);
+    expect(isEndpointCooling(ETH.rpcUrls[0])).toBe(true);
+    fetchMock.mockClear();
+    await expect(getBlockNumber(ETH)).resolves.toBe(1);
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([ETH.rpcUrls[1]]);
+  });
+
+  it('maxUrls counts healthy endpoints only', async () => {
+    // First call: endpoint 0 answers 503 and goes into cooldown.
+    installFetch((url, req) => (url === ETH.rpcUrls[0] ? new HttpFailure(503) : ok(req, '0x1')));
+    await expect(getBlockNumber(ETH)).resolves.toBe(1);
+    expect(isEndpointCooling(ETH.rpcUrls[0])).toBe(true);
+
+    // A 2-endpoint budget now goes to the first two healthy endpoints, not to the cooling one.
+    const fetchMock = installFetch((_url, req) => rpcError(req, -32005, 'query exceeds max block range'));
+    await expect(getLogs(ETH, { fromBlock: 0, toBlock: 10 }, undefined, { maxUrls: 2 })).rejects.toThrow(/max block range/);
+    expect(fetchMock.mock.calls.map((c) => String(c[0]))).toEqual([ETH.rpcUrls[1], ETH.rpcUrls[2]]);
   });
 });
 

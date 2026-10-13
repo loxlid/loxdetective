@@ -4,20 +4,28 @@ import { findChain } from '@/lib/chains/registry';
 import { assessAddress, type RiskInput } from '@/lib/intel/risk';
 import { lookupLabel } from '@/lib/intel/labels';
 import { useAddressSummary } from './useAddressSummary';
-import { useAddressHistory } from './useAddressHistory';
-import { useApprovals } from './useApprovals';
+import { useHistoryRows } from './useHistoryRows';
+import { useApprovalScan } from './useApprovals';
 import { useLabelsRevision } from './useLabel';
 import { useNativePrice } from './usePrices';
 import type { ChainAddressSummary } from './dispatch';
+
+export const APPROVALS_NOT_SCANNED = 'approvals not scanned';
 
 export interface RiskState {
   /** Undefined until at least the summary or a history page is available. */
   report?: RiskReport;
   /** True while any of the inputs is still loading (the report may already be a partial estimate). */
   loading: boolean;
-  /** Which inputs were available when the report was computed. */
+  /** Which inputs were available when the report was computed. `approvals` is false when the scan was incomplete. */
   inputs: { summary: boolean; history: boolean; tokenTransfers: boolean; approvals: boolean };
   errors: Error[];
+  /**
+   * Caveats about the inputs, e.g. "approvals not scanned: <reason>" when the
+   * approval log scan was refused, so the absence of an approval flag is not
+   * read as a clean result.
+   */
+  notes: string[];
 }
 
 /** Registry labels for every counterparty in the rows (lower-cased key, as `RiskInput` expects). */
@@ -71,24 +79,26 @@ export function buildRiskInput(
 
 /**
  * Risk assessment composed from the summary, the first history and token
- * transfer pages, approvals (EVM) and registry labels of the counterparties.
- * All queries are shared with the address page tabs through react-query.
+ * transfer pages (Solana: enriched rows), the approval scan (EVM) and
+ * registry labels of the counterparties. All queries are shared with the
+ * address page tabs through react-query. An incomplete approval scan is
+ * passed as "unknown" (no approvals input) and reported in `notes`.
  */
 export function useRisk(chain: ChainId, address: string): RiskState {
   const info = findChain(chain);
   const summaryQ = useAddressSummary(chain, address);
-  const txH = useAddressHistory(chain, address, 'tx');
-  const tokenH = useAddressHistory(chain, address, 'token');
-  const approvalsQ = useApprovals(chain, address);
+  const rows = useHistoryRows(chain, address);
+  const scanQ = useApprovalScan(chain, address);
   const nativePriceUsd = useNativePrice(chain);
   const rev = useLabelsRevision();
 
   const summary = summaryQ.data;
-  const history = txH.query.data?.pages[0]?.items;
-  const tokenTransfers = tokenH.query.data?.pages[0]?.items;
-  const approvals = approvalsQ.data;
-  // Only the first pages feed the assessment; tell the fresh-wallet check whether they are the whole history.
-  const historyComplete = txH.query.isSuccess && !txH.query.hasNextPage && (!tokenH.supported || (tokenH.query.isSuccess && !tokenH.query.hasNextPage));
+  const history = rows.firstPage.tx;
+  const tokenTransfers = rows.firstPage.token;
+  const scan = scanQ.data;
+  const approvalsScanned = !!scan && !scan.scanIncomplete;
+  const approvals = approvalsScanned ? scan.approvals : undefined;
+  const historyComplete = rows.historyComplete;
 
   const report = useMemo(() => {
     if (!info) return undefined;
@@ -97,13 +107,20 @@ export function useRisk(chain: ChainId, address: string): RiskState {
     // `rev` re-runs the assessment when labels change (feed load, case tags).
   }, [info, chain, address, summary, history, tokenTransfers, approvals, historyComplete, nativePriceUsd, rev]);
 
-  const errors = [summaryQ.error, txH.error, tokenH.error, approvalsQ.error].filter((e): e is Error => !!e);
-  const loading = summaryQ.isLoading || txH.isLoading || tokenH.isLoading || (approvalsQ.isLoading && info?.family === 'evm');
+  const errors = [summaryQ.error, ...rows.errors, scanQ.error].filter((e): e is Error => !!e);
+  const loading = summaryQ.isLoading || rows.loading || (scanQ.isLoading && info?.family === 'evm') || !!rows.enrich?.loading;
+
+  const notes: string[] = [];
+  if (info?.family === 'evm') {
+    if (scan?.scanIncomplete) notes.push(`${APPROVALS_NOT_SCANNED}: ${scan.reason ?? 'the RPC refused part of the log query'}`);
+    else if (scanQ.error) notes.push(`${APPROVALS_NOT_SCANNED}: ${scanQ.error.message}`);
+  }
 
   return {
     report,
     loading,
-    inputs: { summary: !!summary, history: !!history, tokenTransfers: !!tokenTransfers, approvals: !!approvals },
+    inputs: { summary: !!summary, history: !!history, tokenTransfers: !!tokenTransfers, approvals: approvalsScanned },
     errors,
+    notes,
   };
 }

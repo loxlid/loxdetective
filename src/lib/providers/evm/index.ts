@@ -6,7 +6,7 @@
  * unreachable RPC makes the "summary" style calls throw.
  */
 import { maxUint256 } from 'viem';
-import type { AddressSummary, ApprovalInfo, ChainInfo, ContractInfo, PagedResult, TokenBalance, TokenInfo, Transaction, TxListItem } from '@/lib/types';
+import type { AddressSummary, ApprovalInfo, ApprovalScan, ChainInfo, ContractInfo, PagedResult, TokenBalance, TokenInfo, Transaction, TxListItem } from '@/lib/types';
 import { mapLimit } from '@/lib/http';
 import {
   erc20Balance,
@@ -42,7 +42,7 @@ import {
 import * as blockscout from './blockscout';
 import * as etherscan from './etherscan';
 
-export { findTxChain, multiChainBalances, resolveEns, lookupEnsName } from './rpc';
+export { findTxChain, multiChainActivity, multiChainBalances, resolveEns, lookupEnsName, PROBE_TIMEOUT_MS } from './rpc';
 export { hasBlockscout } from './blockscout';
 export { hasEtherscan } from './etherscan';
 
@@ -385,7 +385,7 @@ function padTopicAddress(address: string): string {
 }
 
 /**
- * Token allowances granted by `address`.
+ * Token allowances granted by `address`, with scan status.
  *
  * Blockscout's `/addresses/{a}/logs` endpoint cannot filter by topic, so the
  * only explorer-independent source is `eth_getLogs` on the RPC: topic0 ∈
@@ -394,47 +394,70 @@ function padTopicAddress(address: string): string {
  * so one wide request is tried first; if it is refused the span is split once
  * into 5 chunks (a refused chunk fails fast rather than re-splitting, so a
  * capped RPC costs at most 2 eth_getLogs calls), with a hard cap of 10
- * requests in total. Logs are deduplicated by
- * (token, spender) keeping the latest, zero allowances (revocations) are
- * dropped and token metadata comes from `erc20Meta`. On chains whose RPCs
- * refuse large log queries this returns `[]` with a console warning rather
- * than throwing, so the Approvals tab degrades instead of erroring.
+ * requests in total. Logs are deduplicated by (token, spender) keeping the
+ * latest, zero allowances (revocations) are dropped and token metadata comes
+ * from `erc20Meta`.
+ *
+ * When the RPC refuses the query, the request budget runs out or a chunk
+ * fails, the approvals from the chunks that did succeed are returned with
+ * `scanIncomplete: true` and a human-readable `reason`, so the UI can say
+ * "scan incomplete" instead of showing an empty list as if nothing existed.
+ * Only `eth_blockNumber` failing (RPC down) makes this throw.
  */
-export async function getApprovals(chain: ChainInfo, address: string, signal?: AbortSignal): Promise<ApprovalInfo[]> {
+export async function scanApprovals(chain: ChainInfo, address: string, signal?: AbortSignal): Promise<ApprovalScan> {
   const latest = await getBlockNumber(chain, signal);
   const fromBlock = Math.max(0, latest - APPROVAL_SPAN_BLOCKS);
   const topics = [[TOPIC_APPROVAL, TOPIC_APPROVAL_FOR_ALL], padTopicAddress(address)];
   let requests = 0;
+  const logs: RawEvmLog[] = [];
+  let reason: string | undefined;
 
-  const fetchRange = async (from: number, to: number, depth = 0): Promise<RawEvmLog[]> => {
+  const describe = (err: unknown) => (err instanceof Error ? err.message : String(err));
+  const span = (from: number, to: number) => `blocks ${from.toLocaleString('en-US')}–${to.toLocaleString('en-US')}`;
+
+  const fetchRange = async (from: number, to: number): Promise<RawEvmLog[]> => {
     if (requests >= APPROVAL_MAX_REQUESTS) throw new Error('eth_getLogs request budget exhausted');
     requests++;
-    try {
-      return await getLogs(chain, { fromBlock: from, toBlock: to, topics }, signal, { maxUrls: 2 });
-    } catch (err) {
-      if (isAbortError(err, signal)) throw err;
-      const size = to - from + 1;
-      // Single-level split only: a second level could never finish within the budget
-      // (its siblings would exhaust it and discard everything fetched so far).
-      if (depth > 0 || size < 1_000 || requests + APPROVAL_SPLIT > APPROVAL_MAX_REQUESTS) throw err;
-      const step = Math.ceil(size / APPROVAL_SPLIT);
-      const out: RawEvmLog[] = [];
-      for (let start = from; start <= to; start += step) {
-        out.push(...(await fetchRange(start, Math.min(to, start + step - 1), depth + 1)));
-      }
-      return out;
-    }
+    return getLogs(chain, { fromBlock: from, toBlock: to, topics }, signal, { maxUrls: 2 });
   };
 
-  let logs: RawEvmLog[];
   try {
-    logs = await fetchRange(fromBlock, latest);
-  } catch (err) {
-    if (isAbortError(err, signal)) throw err;
-    console.warn(`[evm] eth_getLogs for approvals unavailable on ${chain.id}:`, err instanceof Error ? err.message : err);
-    return [];
+    logs.push(...(await fetchRange(fromBlock, latest)));
+  } catch (wideErr) {
+    if (isAbortError(wideErr, signal)) throw wideErr;
+    const size = latest - fromBlock + 1;
+    // Single-level split only: a second level could never finish within the budget
+    // (its siblings would exhaust it and discard everything fetched so far).
+    if (size < 1_000 || requests + APPROVAL_SPLIT > APPROVAL_MAX_REQUESTS) {
+      reason = `The ${chain.name} RPC refused the approval log query (${describe(wideErr)}); ${span(fromBlock, latest)} were not scanned.`;
+    } else {
+      const step = Math.ceil(size / APPROVAL_SPLIT);
+      for (let start = fromBlock; start <= latest; start += step) {
+        const end = Math.min(latest, start + step - 1);
+        try {
+          logs.push(...(await fetchRange(start, end)));
+        } catch (chunkErr) {
+          if (isAbortError(chunkErr, signal)) throw chunkErr;
+          // Fail fast: a capped RPC would refuse every remaining chunk too.
+          reason = `The ${chain.name} RPC refused the approval log query (${describe(chunkErr)}); ${span(start, latest)} were not scanned.`;
+          break;
+        }
+      }
+    }
   }
+  if (reason) console.warn(`[evm] approval scan incomplete on ${chain.id}: ${reason}`);
 
+  const approvals = await approvalsFromLogs(chain, address, logs, signal);
+  return { approvals, scanIncomplete: reason !== undefined, fromBlock, toBlock: latest, reason };
+}
+
+/** Approvals only; see {@link scanApprovals} for the scan status. */
+export async function getApprovals(chain: ChainInfo, address: string, signal?: AbortSignal): Promise<ApprovalInfo[]> {
+  return (await scanApprovals(chain, address, signal)).approvals;
+}
+
+/** Reduce raw Approval / ApprovalForAll logs to the active allowances with token metadata and timestamps. */
+async function approvalsFromLogs(chain: ChainInfo, address: string, logs: RawEvmLog[], signal?: AbortSignal): Promise<ApprovalInfo[]> {
   // Latest approval per (token, spender) wins.
   interface Pending {
     token: string;

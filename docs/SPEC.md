@@ -272,9 +272,127 @@ Tests: `tests/stores.test.ts` (use an in-memory localStorage shim).
 
 ## 8. Repo infra (owner: infra module)
 
-- `.github/workflows/deploy.yml`: on push to `main` (and `workflow_dispatch`): checkout, setup-node 22 with npm cache, `npm ci`, `npm run typecheck`, `npm test`, `npm run build`, upload `dist` with `actions/upload-pages-artifact@v3`, deploy with `actions/deploy-pages@v4` (permissions `pages: write`, `id-token: write`; `concurrency: pages`).
-- `.github/workflows/ci.yml`: on pull_request + push to non-main: typecheck, test, build, Playwright e2e (uses bundled Chromium path if present else `npx playwright install --with-deps chromium`).
+- `.github/workflows/deploy.yml`: on push to the repository's default branch (any name; see §9) and `workflow_dispatch`: checkout, setup-node 22 with npm cache, `npm ci`, `npm run typecheck`, `npm test`, `npm run build`, upload `dist` with `actions/upload-pages-artifact@v3`, deploy with `actions/deploy-pages@v4` (permissions `pages: write`, `id-token: write`; `concurrency: pages`).
+- `.github/workflows/ci.yml`: on pull_request + push to non-default branches: typecheck, test, build, Playwright e2e (uses bundled Chromium path if present else `npx playwright install --with-deps chromium`).
 - `public/404.html`: HashRouter needs none, but add a tiny redirect page to `/loxdetective/#/` for deep-link safety.
 - `README.md` (English): badges, what/why, feature list, screenshots placeholder, live link `https://loxlid.github.io/loxdetective/`, local dev, deployment (Settings → Pages → Source: GitHub Actions), data sources table, settings/API keys, privacy & disclaimer, roadmap, license (MIT). `LICENSE` MIT (c) 2026 loxlid.
-- `e2e/smoke.spec.ts`: Playwright test with `page.route` mocks for RPC/Blockscout/esplora/llama endpoints: (1) Home renders & search bar works, (2) searching a 0x address lands on AddressPage with mocked balance shown, (3) tx page renders mocked tx with decoded ERC-20 transfer, (4) settings persists a custom RPC, (5) cases: add entity & note. Any console error fails the test.
+- `e2e/smoke.spec.ts`: Playwright test with `page.route` mocks for RPC/Blockscout/esplora/llama endpoints: (1) Home renders & search bar works, (2) searching a 0x address lands on AddressPage with mocked balance shown, (3) tx page renders mocked tx with decoded ERC-20 transfer, (4) settings persists a custom RPC, (5) cases: add entity & note. Any console error fails the test. Round 2 added: (6) the EVM Overview shows the multi-chain activity strip from the mocked batch (`eth_getTransactionCount` → `0x5`), (7) the Approvals tab shows the scan banner when `eth_getLogs` answers a JSON-RPC error (per-test `overrideRpc` / `rpcErrorFor` helpers in `e2e/mocks.ts`), (8) a trace is saved to a case and reopened from the Cases page. The additive test ids are listed in `docs/UI_TESTIDS.md`.
 - `docs/DATA_SOURCES.md`: list of every endpoint used, CORS status, rate limits, key requirements.
+
+## 9. Round 2 additions
+
+Added after the first implementation round. Existing signatures above are
+unchanged; everything here is additive.
+
+### `src/lib/http.ts` — endpoint cooldown
+```ts
+export const COOLDOWN_MS = 60_000
+export function markEndpointFailed(url: string, now = Date.now()): void
+export function isEndpointCooling(url: string, now = Date.now()): boolean
+export function clearEndpointCooldowns(): void                       // tests / settings changes
+export function isEndpointFailure(err: unknown, signal?: AbortSignal): boolean
+   // true for timeout / network error / HTTP 5xx / 429; false for RpcError, HTTP 4xx (except 429), AbortError or an aborted signal
+export function orderByCooldown(urls: readonly string[], now = Date.now()): string[]
+   // healthy first (original order), then cooling ones (original order) — cooling endpoints are tried last, never dropped
+```
+`withFallback(urls, fn, opts)` keeps its signature; it iterates `orderByCooldown(urls)`, marks a URL on `isEndpointFailure` and clears the mark on success.
+
+### `src/lib/providers/evm/rpc.ts` / `index.ts`
+```ts
+export const PROBE_TIMEOUT_MS = 6_000   // multiChainBalances, multiChainActivity, findTxChain
+export async function multiChainActivity(chains: ChainInfo[], address: string, signal?): Promise<ChainActivity[]>
+   // one jsonRpcBatch [eth_getBalance, eth_getTransactionCount] per chain via withFallback(rpcUrlsFor(chain)), mapLimit 6, never rejects
+export async function scanApprovals(chain: ChainInfo, address: string, signal?): Promise<ApprovalScan>
+   // chunked eth_getLogs; keeps approvals from successful chunks, stops at the first refusal, reports reason + scanned range
+// getApprovals(chain, address, signal?) stays a thin wrapper returning scan.approvals
+// index.ts re-exports: multiChainActivity, PROBE_TIMEOUT_MS (alongside findTxChain, multiChainBalances, resolveEns, lookupEnsName)
+// rpcCall applies orderByCooldown before slicing maxUrls
+```
+
+### `src/lib/settings/store.ts` — Alchemy
+```ts
+export const ALCHEMY_SLUGS: Readonly<Record<string, string>>   // ethereum → eth-mainnet, base → base-mainnet, … sepolia → eth-sepolia (15 chains)
+export function alchemyUrlFor(chain: ChainInfo, apiKey = getSettings().alchemyApiKey): string | undefined
+   // https://<slug>.g.alchemy.com/v2/<encodeURIComponent(key)>
+// rpcUrlsFor(chain) order: custom RPCs, Alchemy (key set and chain served), registry defaults; deduplicated
+```
+
+### `src/lib/chains/registry.ts`
+```ts
+export type HistorySource = 'blockscout' | 'etherscan-key' | 'routescan' | 'esplora' | 'solana-rpc'
+export function historySource(chain: ChainInfo): HistorySource
+export function historyNeedsKey(chain: ChainInfo): boolean   // !blockscoutUrl && etherscanApi?.requiresKey === true
+// Fantom display name: 'Fantom Opera (legacy)' (id / evmChainId / shortName unchanged)
+```
+
+### `src/lib/providers/sol/rpc.ts` — history enrichment
+```ts
+export function solTransfersToRows(address: string, tx: Transaction): TxListItem[]
+   // one row per native / SPL transfer touching `address` (direction, counterparty, amount, token, status, timestamp, slot, enriched: true)
+export async function solEnrichHistory(address: string, items: TxListItem[], opts?: { limit?: number; concurrency?: number; signal?: AbortSignal }): Promise<TxListItem[]>
+   // resolves up to opts.limit (25) successful signature rows via getTransaction, mapLimit(concurrency 3), per-signature cache (500, in-flight dedupe); unchanged rows are returned as the same object; order preserved; rethrows only on abort
+export const SOL_ENRICH_DEFAULT_LIMIT = 25
+export const SOL_ENRICH_DEFAULT_CONCURRENCY = 3
+export const SOL_TX_CACHE_MAX = 500
+export function clearSolTxCache(): void
+export function solTxCacheSize(): number
+```
+
+### `src/lib/providers/btc/esplora.ts` — per-counterparty rows
+```ts
+export function btcTxToListItems(address: string, tx: EsploraTx): TxListItem[]
+   // spend: one 'out' row per output not paid back to an input address (change heuristic), value pro rata to the address's share of input value;
+   // receive: one 'in' row per distinct input address, received amount split by input value (integer, remainder to the largest input);
+   // coinbase → single row from 'coinbase'; consolidations → the singular 'self' row; unrelated tx → []; all rows enriched: true
+export async function btcHistoryDetailed(address: string, opts?: { pages?: number; signal?: AbortSignal }): Promise<TxListItem[]>
+   // up to opts.pages (2) pages of /address/{a}/txs (+ /txs/chain/{lastTxid}), flattened through btcTxToListItems; first page errors throw, later pages end the walk with a console.warn
+export const BTC_DETAILED_DEFAULT_PAGES = 2
+```
+
+### `src/lib/trace/flow.ts`
+No new exports. `createDefaultFlowProvider` uses `btcHistoryDetailed(address, { pages: 2 })` for Bitcoin and `solSignatures` + `solEnrichHistory` (limit 15, concurrency 3, per-address promise cache shared by the `tx` / `token` kinds, enriched rows only) for Solana. `traceFunds` sets `graph.stats.enrichedTxs` (distinct hashes among rows with `enriched === true`; 0 when none).
+
+### `src/lib/intel/labels.ts`
+`BUILTIN_LABELS` gained Bitcoin entries (Binance / HTX cold wallets, Silk Road and Bitfinex-hack seizure addresses, Satoshi block-9 coinbase, Hal Finney, burn addresses) and Solana entries (Stake / Vote / BPF Loader / Address Lookup Table programs, incinerator, Jupiter v4 + DCA, Orca v2, Meteora DLMM, OpenBook v3, Marinade, Wormhole Core, Metaplex Bubblegum, Magic Eden v2, Tensor, JUP / BONK / mSOL / jitoSOL / PYUSD mints).
+
+### `src/lib/types.ts` (append-only)
+```ts
+export interface ChainActivity { chain: ChainId; balance?: NativeBalance; txCount?: number; error?: string }
+export interface ApprovalScan { approvals: ApprovalInfo[]; scanIncomplete: boolean; fromBlock?: number; toBlock?: number; reason?: string }
+TxListItem.enriched?: boolean
+FlowGraph.stats.enrichedTxs?: number
+export interface CaseAttachment { id: string; kind: 'trace'; title: string; createdAt: number; chain: ChainId; root: string; options: Omit<TraceOptions, 'signal' | 'onProgress'>; data: string /* graphToJson */ }
+InvestigationCase.attachments?: CaseAttachment[]   // absent when empty
+```
+
+### `src/lib/cases/store.ts` — attachments
+```ts
+export const CASE_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
+export type NewCaseAttachment = Omit<CaseAttachment, 'id' | 'createdAt'>
+useCases.addAttachment(caseId, a: NewCaseAttachment): CaseAttachment | undefined
+   // undefined for an unknown case; throws Error('Invalid attachment') on a bad shape, Error('Attachment too large …') above the cap,
+   // and Error('Could not save the attachment: …') when localStorage refuses the write (state is rolled back)
+useCases.removeAttachment(caseId, attachmentId): void             // the key disappears when the last attachment goes
+export function parseAttachment(raw: unknown, now = Date.now()): CaseAttachment | undefined   // shape + size validation (used by import and rehydration)
+export function attachmentBytes(data: string): number                                        // UTF-8 size
+// exportCase / importCase carry attachments; import rejects a case file with a malformed or oversized attachment ('Invalid case file');
+// storage rehydration drops broken attachments but keeps the case.
+```
+
+### Pages
+```ts
+// src/pages/TracePage.tsx
+export type SavedTraceOptions = CaseAttachment['options']
+export function traceQueryFor(o: SavedTraceOptions): string                 // 'hops=&fanout=&direction=&stop=&minUsd=&tokens='
+export function formFromSearch(search: string | URLSearchParams, base = DEFAULT_TRACE_FORM): TraceForm   // prefill from the query string; invalid values fall back, numbers clamp
+export function traceTitle(chainName: string, address: string, o: SavedTraceOptions): string
+// "Save trace to case" button (data-testid trace-save-case): active case / inline picker / creates "New case"; CSV + JSON export via src/lib/export
+// src/pages/CasesPage.tsx
+export function attachmentStats(data: string): { nodes: number; edges: number; hops?: number; error?: string }   // lazy JSON.parse, never throws
+export function attachmentTraceLink(a: Pick<CaseAttachment, 'chain' | 'root' | 'options'>): string             // /trace/:chain/:root?<traceQueryFor>
+// "Saved traces" card per case: title, chain, root, node / edge counts, options, Open trace, Download JSON (downloadJson), Remove
+```
+
+### Workflows
+- `deploy.yml`: triggered by a push to any branch plus `workflow_dispatch`; the build and deploy jobs run only when `github.ref == format('refs/heads/{0}', github.event.repository.default_branch)` (or on manual dispatch); `actions/configure-pages@v5` (Pages must be enabled once by hand under Settings → Pages → Source: GitHub Actions; the default `GITHUB_TOKEN` cannot enable it); permissions `contents: read`, `pages: write`, `id-token: write`; concurrency group `pages` without cancel-in-progress; environment `github-pages` with the `page_url` output.
+- `ci.yml`: `pull_request` plus pushes to any branch, guarded by the inverted condition so the default branch is not checked twice.

@@ -1,11 +1,15 @@
 # Continuous integration for pull requests and feature branches:
 # typecheck → unit tests → production build → Playwright smoke tests.
+#
+# Pushes to the repository's default branch are deployed by deploy.yml (which
+# runs the same typecheck / test / build steps), so this workflow skips them
+# to avoid running everything twice. Pull requests always run.
 name: CI
 
 on:
   pull_request:
   push:
-    branches-ignore: [main]
+    branches: ['**']
 
 permissions:
   contents: read
@@ -24,6 +28,8 @@ env:
 jobs:
   check:
     name: Typecheck, test, build, e2e
+    # Every pull request, plus pushes to any branch except the default one.
+    if: github.event_name == 'pull_request' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:

@@ -74,6 +74,97 @@ describe('BUILTIN_LABELS', () => {
     expect(lookupLabel('0x3f5CE5FBFe3E9af3971dD833D26bA9b5C936f0bE', 'ethereum')?.name).toMatch(/^Binance 1 /);
   });
 
+  it('labels well-known Bitcoin exchange, seizure and historic addresses on bitcoin only', () => {
+    const exchange = ['34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo', 'bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h', '3M219KR5vEneNb47ewrPfWyb5jQ2DjxRP6', '1LQoWist8KkaUXSPKZHNvEyfrEkPHzSsCd', BTC_BITFINEX];
+    for (const a of exchange) {
+      expect(lookupLabel(a, 'bitcoin')?.category, a).toBe('exchange');
+      expect(lookupLabel(a, 'ethereum'), a).toBeUndefined();
+      expect(lookupLabel(a, 'solana'), a).toBeUndefined();
+    }
+    expect(lookupLabel('bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h', 'bitcoin')?.name).toMatch(/Binance/);
+    expect(lookupLabel('1LQoWist8KkaUXSPKZHNvEyfrEkPHzSsCd', 'bitcoin')?.name).toMatch(/Huobi/);
+    // Seizures / historic wallets carry a clear name but are not exchanges.
+    expect(lookupLabel('1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa', 'bitcoin')).toMatchObject({ category: 'other', name: expect.stringMatching(/Genesis/) });
+    expect(lookupLabel('1FfmbHfnpaZjKFvyi1okTjJJusN455paPH', 'bitcoin')).toMatchObject({ category: 'other', name: expect.stringMatching(/Silk Road/) });
+    expect(lookupLabel('1HQ3Go3ggs8pFnXuHVHRytPCq5fGG8Hbhx', 'bitcoin')).toMatchObject({ category: 'other', name: expect.stringMatching(/Silk Road/) });
+    expect(lookupLabel('bc1qazcm763858nkj2dj986etajv6wquslv8uxwczt', 'bitcoin')).toMatchObject({ category: 'other', name: expect.stringMatching(/Bitfinex 2016 hack/) });
+    expect(lookupLabel('12cbQLTFMXRnSzktFkuoG3eHoMeFtpTu3S', 'bitcoin')?.name).toMatch(/Satoshi/);
+    expect(lookupLabel('1Q2TWHE3GMdB6BZKafqwxXtWAWgFt5Jvm3', 'bitcoin')?.name).toMatch(/Hal Finney/);
+    expect(lookupLabel('1BitcoinEaterAddressDontSendf59kuE', 'bitcoin')?.category).toBe('burn');
+    expect(lookupLabel('1CounterpartyXXXXXXXXXXXXXXXUWLpVr', 'bitcoin')?.category).toBe('burn');
+    // Base58 is case-sensitive; bech32 is not.
+    expect(lookupLabel('3m219kr5veneNb47ewrPfWyb5jQ2DjxRP6', 'bitcoin')).toBeUndefined();
+    expect(lookupLabel('BC1QM34LSC65ZPW79LXES69ZKQMK6EE3EWF0J77S3H', 'bitcoin')?.category).toBe('exchange');
+  });
+
+  it('labels the core Solana programs, DEXes and mints with the right categories', () => {
+    const infra = [
+      '11111111111111111111111111111111',
+      'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+      'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+      'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr',
+      'ComputeBudget111111111111111111111111111111',
+      'Stake11111111111111111111111111111111111111',
+      'Vote111111111111111111111111111111111111111',
+      'BPFLoaderUpgradeab1e11111111111111111111111',
+      'AddressLookupTab1e1111111111111111111111111',
+    ];
+    for (const a of infra) {
+      expect(lookupLabel(a, 'solana')?.category, a).toBe('infrastructure');
+      expect(lookupLabel(a, 'ethereum'), a).toBeUndefined();
+      expect(lookupLabel(a, 'bitcoin'), a).toBeUndefined();
+    }
+    expect(lookupLabel('11111111111111111111111111111111', 'solana')?.name).toBe('System Program');
+    expect(lookupLabel('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb', 'solana')?.name).toMatch(/Token-2022/);
+    expect(lookupLabel('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', 'solana')?.name).toMatch(/Associated Token/);
+    expect(lookupLabel('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', 'solana')?.name).toMatch(/Memo/);
+    const dex = [
+      'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
+      'JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB',
+      'DCA265Vj8a9CEuX1eb1LWRnDT7uK6q1xMipnNyatn23M',
+      '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+      'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK',
+      'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
+      'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc',
+      '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP',
+      'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo',
+      'srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX',
+      '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
+    ];
+    for (const a of dex) expect(lookupLabel(a, 'solana')?.category, a).toBe('dex');
+    expect(lookupLabel('whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc', 'solana')?.name).toMatch(/Orca/);
+    expect(lookupLabel('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', 'solana')?.name).toMatch(/Raydium/);
+    expect(lookupLabel('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', 'solana')?.name).toMatch(/Pump\.fun/);
+    const tokens = [
+      'So11111111111111111111111111111111111111112',
+      'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+      'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+      'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN',
+      'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+      'mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So',
+      'J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn',
+      '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo',
+    ];
+    for (const a of tokens) expect(lookupLabel(a, 'solana')?.category, a).toBe('token');
+    expect(lookupLabel('So11111111111111111111111111111111111111112', 'solana')?.name).toMatch(/Wrapped SOL/);
+    expect(lookupLabel('1nc1nerator11111111111111111111111111111111', 'solana')?.category).toBe('burn');
+    expect(lookupLabel('worm2ZoG2kUd4vFXhvjh93UUH596ayRfgQ2MgjNMTth', 'solana')?.category).toBe('bridge');
+    expect(lookupLabel('M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K', 'solana')?.category).toBe('nft');
+    expect(lookupLabel('TSWAPaqyCSx2KABk68Shruf4rp7CxcNi8hAsbdwmHbN', 'solana')?.category).toBe('nft');
+    expect(lookupLabel('BGUMAp9Gq7iTEuizy4pqaxsTyUCBK68MDfK752saRPUY', 'solana')?.category).toBe('nft');
+  });
+
+  it('counts the non-EVM entries', () => {
+    const btc = BUILTIN_LABELS.filter((l) => l.chain === 'bitcoin');
+    const sol = BUILTIN_LABELS.filter((l) => l.chain === 'solana');
+    expect(btc.length).toBeGreaterThanOrEqual(14);
+    expect(sol.length).toBeGreaterThanOrEqual(35);
+    for (const l of btc) expect(l.address, l.name).toMatch(/^(bc1[0-9a-z]{6,90}|[13][1-9A-HJ-NP-Za-km-z]{25,34})$/);
+    for (const l of sol) expect(l.address, l.name).toMatch(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/);
+    expect(btc.filter((l) => l.category === 'exchange').length).toBeGreaterThanOrEqual(5);
+  });
+
   it('names the Tornado stablecoin pools by their real denominations', () => {
     expect(lookupLabel('0xd96f2B1c14Db8458374d9Aca76E26c3D18364307', 'ethereum')?.name).toBe('Tornado Cash: 100 USDC pool');
     expect(lookupLabel('0x4736dCf1b7A3d580672CcE6E7c65cd5cc9cFBa19', 'ethereum')?.name).toBe('Tornado Cash: 1,000 USDC pool');

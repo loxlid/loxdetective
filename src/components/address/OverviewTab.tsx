@@ -1,12 +1,12 @@
-import { useMemo } from 'react';
+import { Fragment, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChainId, ChainInfo, NativeBalance, TxListItem } from '@/lib/types';
+import type { ChainActivity, ChainId, ChainInfo, NativeBalance, TxListItem } from '@/lib/types';
 import { findChain } from '@/lib/chains/registry';
 import { formatAmount, formatDate, formatUsd } from '@/lib/format';
 import { usdValue } from '@/lib/providers/prices';
 import type { ChainAddressSummary } from '@/hooks/dispatch';
 import { useAddressHistory } from '@/hooks/useAddressHistory';
-import { useMultiChainBalances } from '@/hooks/useMultiChainBalances';
+import { chainName, isActiveChain, orderActivity, otherActiveChains, summaryLooksInactive, useMultiChainActivity } from '@/hooks/useMultiChainActivity';
 import { useNativePrice } from '@/hooks/usePrices';
 import AddressDisplay from '@/components/AddressDisplay';
 import Card from '@/components/Card';
@@ -16,7 +16,9 @@ import ErrorBox from '@/components/ErrorBox';
 import Spinner from '@/components/Spinner';
 import StatGrid, { type Stat } from '@/components/StatGrid';
 import Timestamp from '@/components/Timestamp';
+import CounterpartiesCard from './CounterpartiesCard';
 import TokenMeta from './TokenMeta';
+import UtxoCard from './UtxoCard';
 
 interface Props {
   chain: ChainInfo;
@@ -77,31 +79,44 @@ export function orderBalances(list: readonly NativeBalance[]): NativeBalance[] {
   });
 }
 
-/** Native balance of an EVM address on every supported EVM chain, each tile linking to that chain's profile. */
-export function MultiChainBalances({ address, current }: { address: string; current: ChainId }) {
-  const q = useMultiChainBalances(address);
-  const list = useMemo(() => orderBalances(q.data ?? []), [q.data]);
+/** "Active on X of Y chains" header line of the activity strip. */
+export function activityHeadline(list: readonly ChainActivity[]): string {
+  const active = list.filter(isActiveChain);
+  const total = active.reduce((s, a) => s + (a.balance && !a.balance.error ? (a.balance.usd ?? 0) : 0), 0);
+  const base = `Active on ${active.length} of ${list.length} chain${list.length === 1 ? '' : 's'}`;
+  return active.length ? `${base} · ≈ ${formatUsd(total)} in native balances` : `${base}.`;
+}
+
+/** "n txs" label of an activity tile. */
+export function txCountLabel(a: ChainActivity): string {
+  if (a.txCount === undefined) return 'n/a';
+  return `${a.txCount.toLocaleString('en-US')} tx${a.txCount === 1 ? '' : 's'}`;
+}
+
+/** Activity (balance + transaction count) of an EVM address on every supported EVM chain, each tile linking to that chain's profile. */
+export function MultiChainActivityStrip({ address, current, query }: { address: string; current: ChainId; query: ReturnType<typeof useMultiChainActivity> }) {
+  const q = query;
+  const list = useMemo(() => orderActivity(q.data ?? []), [q.data]);
   if (q.isLoading) return <Spinner label="Querying every EVM chain…" />;
   if (q.error && !q.data) return <ErrorBox error={q.error} onRetry={() => void q.refetch()} compact />;
-  if (list.length === 0) return <EmptyState compact title="No balances" />;
-  const funded = list.filter((b) => !b.error && b.balance > 0n);
-  const total = funded.reduce((s, b) => s + (b.usd ?? 0), 0);
+  if (list.length === 0) return <EmptyState compact title="No chains probed" />;
   return (
     <>
-      <p className="inline-note">
-        {funded.length === 0 ? 'No native balance on any EVM chain.' : `${funded.length} chain${funded.length === 1 ? '' : 's'} with a balance · ≈ ${formatUsd(total)} in total.`}
-      </p>
+      <p className="inline-note">{activityHeadline(list)}</p>
       <div className="balances-strip">
-        {list.map((b) => {
-          const info = findChain(b.chain);
-          const zero = !b.error && b.balance === 0n;
-          const cls = `balance-tile${b.chain === current ? ' is-current' : ''}${zero ? ' is-zero' : ''}`;
-          const title = b.error ? `${info?.name ?? b.chain}: RPC error — ${b.error}` : `Open this address on ${info?.name ?? b.chain}`;
+        {list.map((a) => {
+          const info = findChain(a.chain);
+          const b = a.balance && !a.balance.error ? a.balance : undefined;
+          const failed = !b && a.txCount === undefined;
+          const active = isActiveChain(a);
+          const cls = `balance-tile activity-tile${a.chain === current ? ' is-current' : ''}${!active && !failed ? ' is-zero' : ''}${failed ? ' is-failed' : ''}`;
+          const title = failed ? `${info?.name ?? a.chain}: RPC error — ${a.error ?? 'unavailable'}` : `Open this address on ${info?.name ?? a.chain}${a.error ? ` (partial: ${a.error})` : ''}`;
           return (
-            <Link key={b.chain} to={`/address/${b.chain}/${address}`} className={cls} title={title}>
-              <ChainBadge chain={info ?? b.chain} size="sm" />
-              <span className="balance-tile__amount">{b.error ? <span className="muted">n/a</span> : `${formatAmount(b.balance, b.decimals, 4)} ${b.symbol}`}</span>
-              <span className="balance-tile__usd">{b.error ? 'RPC unavailable' : formatUsd(b.usd)}</span>
+            <Link key={a.chain} to={`/address/${a.chain}/${address}`} className={cls} title={title}>
+              <ChainBadge chain={info ?? a.chain} size="sm" />
+              <span className="balance-tile__amount">{b ? `${formatAmount(b.balance, b.decimals, 4)} ${b.symbol}` : <span className="muted">n/a</span>}</span>
+              <span className="balance-tile__usd">{b ? formatUsd(b.usd) : failed ? 'RPC unavailable' : '—'}</span>
+              <span className={`activity-tile__txs${a.txCount === undefined ? ' muted' : ''}`}>{txCountLabel(a)}</span>
             </Link>
           );
         })}
@@ -110,12 +125,38 @@ export function MultiChainBalances({ address, current }: { address: string; curr
   );
 }
 
-/** Overview tab: key figures, family-specific extras, multi-chain balances (EVM) and token metadata. */
+/** Previous name of the strip (kept for callers). */
+export { MultiChainActivityStrip as MultiChainBalances };
+
+/** One-line callout when the address is idle on the current chain but active elsewhere. */
+export function ActiveElsewhereCallout({ current, others, address }: { current: ChainId; others: readonly ChainActivity[]; address: string }) {
+  if (!others.length) return null;
+  return (
+    <p className="callout callout--info" role="status" data-testid="address-active-elsewhere">
+      No activity on {chainName(current)} — this address is active on{' '}
+      {others.map((a, i) => (
+        <Fragment key={a.chain}>
+          {i > 0 && ', '}
+          <Link to={`/address/${a.chain}/${address}`}>{chainName(a.chain)}</Link> ({txCountLabel(a)})
+        </Fragment>
+      ))}
+      .
+    </p>
+  );
+}
+
+/** Overview tab: key figures, family-specific extras, multi-chain activity (EVM), counterparties, UTXOs (BTC) and token metadata. */
 export default function OverviewTab({ chain, address, summary, loading, error, onRetry }: Props) {
   const nativePrice = useNativePrice(chain.id);
   // Shares the react-query cache with the Transactions tab and the risk hook.
   const history = useAddressHistory(chain.id, address, 'tx');
   const seen = useMemo(() => seenRange(summary, history.items, history.hasMore), [summary, history.items, history.hasMore]);
+  // Disabled (no network) for non-EVM addresses.
+  const activityQ = useMultiChainActivity(chain.family === 'evm' ? address : '');
+  const elsewhere = useMemo(
+    () => (chain.family === 'evm' && summaryLooksInactive(summary) ? otherActiveChains(activityQ.data ?? [], chain.id) : []),
+    [chain.family, chain.id, summary, activityQ.data],
+  );
 
   const bal = summary?.nativeBalance;
   const pending = loading ? '…' : '—';
@@ -190,14 +231,17 @@ export default function OverviewTab({ chain, address, summary, loading, error, o
   return (
     <>
       {error && !summary && <ErrorBox error={error} onRetry={onRetry} title="Address summary unavailable" />}
+      <ActiveElsewhereCallout current={chain.id} others={elsewhere} address={address} />
       <Card title="Overview" subtitle={loading && !summary ? 'Loading summary…' : undefined}>
         <StatGrid stats={stats} />
       </Card>
       {chain.family === 'evm' && (
-        <Card title="Balances across EVM chains" subtitle="Native balance of the same address on every supported EVM network">
-          <MultiChainBalances address={address} current={chain.id} />
+        <Card title="Activity across EVM chains" subtitle="Native balance and outgoing transaction count of the same address on every supported EVM network" testId="address-activity-strip">
+          <MultiChainActivityStrip address={address} current={chain.id} query={activityQ} />
         </Card>
       )}
+      {chain.family === 'bitcoin' && <UtxoCard address={address} nativePrice={nativePrice} />}
+      <CounterpartiesCard chain={chain} address={address} />
       {summary?.contract?.token && (
         <Card title="Token contract" subtitle="This address is a token contract">
           <TokenMeta token={summary.contract.token} chain={chain.id} />

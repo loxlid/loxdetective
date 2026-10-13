@@ -170,7 +170,7 @@ export default function SettingsPage() {
       <div className="settings-grid">
         <Card
           title="API keys"
-          subtitle="Optional. Keys unlock history on chains without a Blockscout instance and raise rate limits."
+          subtitle="Optional. Keys unlock history on chains without a Blockscout instance, add a dedicated RPC provider and raise rate limits. Each key is only ever sent to its own provider."
           actions={
             <button type="button" className="btn btn--ghost btn--sm" onClick={() => setShowKeys((v) => !v)}>
               {showKeys ? 'Hide keys' : 'Show keys'}
@@ -189,9 +189,12 @@ export default function SettingsPage() {
               <span className="field__hint">When set, Helius is tried before the public Solana RPCs.</span>
             </label>
             <label className="field">
-              <span className="field__label">Alchemy API key</span>
-              <input className="input mono" type={showKeys ? 'text' : 'password'} value={draft.alchemyApiKey} onChange={(e) => patch('alchemyApiKey', e.target.value)} placeholder="Optional (stored for future use)" autoComplete="off" spellCheck={false} />
-              <span className="field__hint">Stored only; add an Alchemy URL as a custom RPC below to use it today.</span>
+              <span className="field__label">Alchemy API key (EVM RPC)</span>
+              <input data-testid="settings-alchemy-key" className="input mono" type={showKeys ? 'text' : 'password'} value={draft.alchemyApiKey} onChange={(e) => patch('alchemyApiKey', e.target.value)} placeholder="Optional" autoComplete="off" spellCheck={false} />
+              <span className="field__hint">
+                When set, <code>https://&lt;network&gt;.g.alchemy.com/v2/&lt;key&gt;</code> is used as the JSON-RPC endpoint for the EVM chains Alchemy serves (Ethereum, Base, Arbitrum, OP Mainnet, Polygon, zkSync, Linea, Scroll, Blast, BNB
+                Chain, Avalanche, Gnosis, Polygon zkEVM, Celo, Sepolia), after your custom RPCs and before the public ones. Chains Alchemy does not serve keep using the public endpoints.
+              </span>
             </label>
           </div>
         </Card>
@@ -230,7 +233,10 @@ export default function SettingsPage() {
         </Card>
       </div>
 
-      <Card title="Custom RPC endpoints" subtitle={`One URL per line. Custom endpoints are tried first, then the built-in public ones. ${customCount ? `${customCount} custom endpoint${customCount === 1 ? '' : 's'} configured.` : ''}`}>
+      <Card
+        title="Custom RPC endpoints"
+        subtitle={`One URL per line. Custom endpoints are tried first, then Alchemy (when a key is set), then the built-in public ones; an endpoint that times out, errors or rate-limits is moved to the back of the queue for a minute. ${customCount ? `${customCount} custom endpoint${customCount === 1 ? '' : 's'} configured.` : ''}`}
+      >
         {onHttps && insecureRpc.length > 0 && (
           <p className="field__hint" role="alert" data-testid="settings-rpc-insecure">
             This site is served over https, so the browser blocks plain http:// endpoints (mixed content) and they will be skipped in favour of the public RPCs: {insecureRpc.join(', ')}. Use an https URL, a reverse proxy with TLS, or http://localhost.

@@ -212,6 +212,12 @@ export interface TxListItem {
   direction: 'in' | 'out' | 'self' | 'unknown';
   /** Token transfer summary when the row is a token movement. */
   token?: { symbol: string; amount: Amount; tokenAddress?: string; kind: Transfer['kind'] };
+  /**
+   * True when the row was derived from full transaction details (Solana
+   * `getTransaction` enrichment, Bitcoin per-counterparty rows) rather than
+   * from a signature / summary listing.
+   */
+  enriched?: boolean;
 }
 
 export interface PagedResult<T> {
@@ -298,7 +304,13 @@ export interface FlowGraph {
   edges: FlowEdge[];
   /** Addresses that were not expanded (depth / fan-out limits). */
   truncated: string[];
-  stats: { hops: number; txsScanned: number; durationMs: number };
+  stats: {
+    hops: number;
+    txsScanned: number;
+    durationMs: number;
+    /** Distinct transactions whose full details were fetched (Solana / Bitcoin enrichment). */
+    enrichedTxs?: number;
+  };
 }
 
 export interface TraceOptions {
@@ -338,6 +350,8 @@ export interface InvestigationCase {
   updatedAt: number;
   entities: CaseEntity[];
   notes: CaseNote[];
+  /** Saved traces (absent when the case has none). */
+  attachments?: CaseAttachment[];
 }
 
 export interface AppSettings {
@@ -370,4 +384,44 @@ export interface ApprovalInfo {
   blockNumber?: number;
   /** Label of the spender when known (filled by the UI / intel layer). */
   spenderLabel?: string;
+}
+
+/** Per-chain balance + nonce probe result (`multiChainActivity`); a failed chain carries `error`. */
+export interface ChainActivity {
+  chain: ChainId;
+  balance?: NativeBalance;
+  /** Outgoing transaction count (nonce) when the probe succeeded. */
+  txCount?: number;
+  error?: string;
+}
+
+/** Result of `scanApprovals`: the approvals found plus whether the log scan covered the whole span. */
+export interface ApprovalScan {
+  approvals: ApprovalInfo[];
+  /** true when eth_getLogs was refused, the request budget ran out or a chunk failed; `reason` says why. */
+  scanIncomplete: boolean;
+  /** First block of the scanned span (inclusive). */
+  fromBlock?: number;
+  /** Last block of the scanned span (inclusive). */
+  toBlock?: number;
+  /** Human-readable explanation when `scanIncomplete` is true. */
+  reason?: string;
+}
+
+/**
+ * A fund-flow trace saved into an investigation case (`CasesState.addAttachment`).
+ * `data` is the `graphToJson` export of the graph; `options` are the trace
+ * settings so the trace can be re-run from the Cases page.
+ */
+export interface CaseAttachment {
+  id: string;
+  kind: 'trace';
+  title: string;
+  createdAt: number;
+  chain: ChainId;
+  /** Root address of the trace (display form). */
+  root: string;
+  options: Omit<TraceOptions, 'signal' | 'onProgress'>;
+  /** `graphToJson(graph)` output; capped at `CASE_ATTACHMENT_MAX_BYTES` by the store. */
+  data: string;
 }

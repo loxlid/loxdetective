@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, createElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { getAddress } from 'viem';
+import { clearEndpointCooldowns } from '@/lib/http';
 import { registerLabels } from '@/lib/intel/labels';
+import { clearSolTxCache } from '@/lib/providers/sol/rpc';
 import { BUILTIN_SANCTIONED } from '@/lib/intel/sanctions';
 import {
   createDefaultFlowProvider,
@@ -154,6 +156,7 @@ describe('traceFunds', () => {
     expect(node(g, C)?.totalInUsd).toBeCloseTo(4000);
     expect(g.stats.txsScanned).toBe(2);
     expect(g.stats.hops).toBe(1);
+    expect(g.stats.enrichedTxs).toBe(0);
     // With one hop the counterparties would have been expanded but were not.
     expect(g.truncated.sort()).toEqual([B, C].sort());
   });
@@ -557,6 +560,8 @@ function bsTx(h: string, from: string, to: string, value: string) {
 describe('createDefaultFlowProvider', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    clearEndpointCooldowns();
+    clearSolTxCache();
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -611,6 +616,44 @@ describe('createDefaultFlowProvider', () => {
     await expect(p.history('ethereum', OWNER, 'tx')).rejects.toThrow();
     await expect(p.history('ethereum', OWNER, 'token')).resolves.toEqual([]);
     expect(warn).toHaveBeenCalled();
+  });
+
+  it('expands a Bitcoin batch payout into one row per external output across two Esplora pages', async () => {
+    const BTC_THIRD = '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa';
+    const mk = (id: string, status: Record<string, unknown>) => ({
+      txid: id,
+      vin: [{ txid: 'e'.repeat(64), vout: 0, prevout: { scriptpubkey_address: BTC_ADDR, value: 100_000, scriptpubkey_type: 'v0_p2wpkh' } }],
+      vout: [
+        { scriptpubkey_address: BTC_OTHER, value: 40_000, scriptpubkey_type: 'v0_p2wpkh' },
+        { scriptpubkey_address: BTC_THIRD, value: 30_000, scriptpubkey_type: 'p2pkh' },
+        { scriptpubkey_address: BTC_ADDR, value: 29_000, scriptpubkey_type: 'v0_p2wpkh' },
+      ],
+      fee: 1000,
+      status,
+    });
+    const first = Array.from({ length: 25 }, (_, i) => mk(i.toString(16).padStart(64, 'a'), { confirmed: true, block_height: 840_000 - i, block_time: 1_713_571_767 - i }));
+    const second = [mk('b'.repeat(64), { confirmed: true, block_height: 839_000, block_time: 1_713_000_000 })];
+    const fetchMock = installFetch((url) => {
+      if (url.hostname !== 'mempool.space') return undefined;
+      if (url.pathname === `/api/address/${BTC_ADDR}/txs`) return { body: first };
+      if (url.pathname === `/api/address/${BTC_ADDR}/txs/chain/${first[24].txid}`) return { body: second };
+      return undefined;
+    });
+    const p = createDefaultFlowProvider();
+    const rows = await p.history('bitcoin', BTC_ADDR, 'tx');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(rows).toHaveLength(52);
+    expect(rows[0]).toMatchObject({ direction: 'out', from: BTC_ADDR, to: BTC_OTHER, enriched: true });
+    expect(rows[0].value.raw).toBe(40_000n);
+    expect(rows[1]).toMatchObject({ direction: 'out', to: BTC_THIRD });
+    expect(rows[1].value.raw).toBe(30_000n);
+    expect(rows.some((r) => r.to === BTC_ADDR)).toBe(false); // change is skipped
+
+    // Traced, the payout becomes N edges and the enrichment is reported in the stats.
+    const g = await traceFunds('bitcoin', BTC_ADDR, { ...baseOpts, maxHops: 1, direction: 'out', includeTokens: false }, p);
+    expect(g.edges.map((e) => e.target).sort()).toEqual([BTC_THIRD, BTC_OTHER].sort());
+    expect(g.edges.find((e) => e.target === BTC_OTHER)?.transfers).toHaveLength(26);
+    expect(g.stats.enrichedTxs).toBe(26);
   });
 
   it('serves Bitcoin history from Esplora and no token rows', async () => {
@@ -698,6 +741,12 @@ describe('createDefaultFlowProvider', () => {
     // Only the successful signature is fetched, and only once for both kinds.
     expect(getTx).toHaveBeenCalledTimes(1);
     expect(getTx).toHaveBeenCalledWith(SOL_SIG_OK);
+
+    const g = await traceFunds('solana', SOL_PAYER, { ...baseOpts, maxHops: 1, maxFanOut: 3, direction: 'both', stopAtLabelled: false }, p);
+    expect(g.edges).toHaveLength(1);
+    expect(g.edges[0].transfers).toHaveLength(2);
+    expect(g.stats.enrichedTxs).toBe(1);
+    expect(getTx).toHaveBeenCalledTimes(1);
   });
 
   it('resolves labels from the registry and the sanctions list', () => {

@@ -17,14 +17,13 @@
 import { getAddress } from 'viem';
 import { findChain } from '@/lib/chains/registry';
 import { formatAmount, shorten, toNumber } from '@/lib/format';
-import { mapLimit } from '@/lib/http';
 import { lookupLabel } from '@/lib/intel/labels';
 import { isSanctioned } from '@/lib/intel/sanctions';
-import { btcAddressTxs } from '@/lib/providers/btc/esplora';
+import { btcHistoryDetailed } from '@/lib/providers/btc/esplora';
 import { getAddressHistory } from '@/lib/providers/evm';
 import { getCode } from '@/lib/providers/evm/rpc';
 import { getPrices, priceKeyForToken } from '@/lib/providers/prices';
-import { solAddressSummary, solSignatures, solTransaction } from '@/lib/providers/sol/rpc';
+import { solAddressSummary, solEnrichHistory, solSignatures } from '@/lib/providers/sol/rpc';
 import type {
   AddressLabel,
   Amount,
@@ -35,7 +34,6 @@ import type {
   RiskLevel,
   TokenInfo,
   TraceOptions,
-  Transaction,
   Transfer,
   TxListItem,
 } from '@/lib/types';
@@ -80,6 +78,8 @@ const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 const MAX_HOPS = 10;
 /** Pages of history fetched per node by the default EVM provider. */
 const DEFAULT_EVM_PAGES = 2;
+/** Pages of Esplora history walked per node by the default Bitcoin provider. */
+const DEFAULT_BTC_PAGES = 2;
 /** Solana: signatures enriched with `getTransaction` per node. */
 const SOL_ENRICH_LIMIT = 15;
 const SOL_ENRICH_CONCURRENCY = 3;
@@ -305,11 +305,12 @@ export async function traceFunds(chain: ChainId, root: string, opts: TraceOption
     nodes: [],
     edges: [],
     truncated: [],
-    stats: { hops: 0, txsScanned: 0, durationMs: 0 },
+    stats: { hops: 0, txsScanned: 0, durationMs: 0, enrichedTxs: 0 },
   };
   const nodes = new Map<string, FlowNode>();
   const edges = new Map<string, FlowEdge>();
   const seenTransfers = new Set<string>();
+  const enrichedHashes = new Set<string>();
   const expanded = new Set<string>();
   const failed = new Set<string>();
   const queued = new Set<string>();
@@ -382,6 +383,8 @@ export async function traceFunds(chain: ChainId, root: string, opts: TraceOption
     }
     throwIfAborted(signal);
     graph.stats.txsScanned += rows.length;
+    for (const row of rows) if (row?.enriched && row.hash) enrichedHashes.add(row.hash);
+    graph.stats.enrichedTxs = enrichedHashes.size;
 
     if (provider.prefetchPrices) {
       try {
@@ -594,44 +597,19 @@ export interface DefaultFlowProvider extends FlowProvider {
   prefetchPrices(chain: ChainId, tokenAddresses: string[], signal?: AbortSignal): Promise<void>;
 }
 
-/** Convert the transfers of enriched Solana transactions into history rows for `address`. */
-function solTransfersToRows(txs: readonly Transaction[], address: string, kind: 'tx' | 'token'): TxListItem[] {
-  const rows: TxListItem[] = [];
-  for (const tx of txs) {
-    for (const t of tx.transfers) {
-      const isToken = t.kind === 'SPL';
-      if (kind === 'tx' ? isToken : !isToken) continue;
-      if (t.from !== address && t.to !== address) continue;
-      const direction: TxListItem['direction'] = t.from === t.to ? 'self' : t.from === address ? 'out' : 'in';
-      rows.push({
-        chain: tx.chain,
-        hash: tx.hash,
-        timestamp: tx.timestamp,
-        blockNumber: tx.blockNumber,
-        from: t.from,
-        to: t.to,
-        value: t.amount,
-        status: tx.status,
-        methodName: tx.methodName,
-        direction,
-        token: isToken ? { symbol: t.amount.symbol, amount: t.amount, tokenAddress: t.token?.address, kind: t.kind } : undefined,
-      });
-    }
-  }
-  return rows;
-}
-
 /**
  * Wires the real providers: EVM history via the evm façade (up to two pages
- * of `tx` and `token` rows), Bitcoin via Esplora (first page), Solana via
- * `getSignaturesForAddress` enriched with `getTransaction` for the newest
- * signatures; labels from the registry (+ sanctions); contract detection via
- * `eth_getCode` (cached); prices from DefiLlama through `prefetchPrices`.
+ * of `tx` and `token` rows), Bitcoin via `btcHistoryDetailed` (up to two
+ * Esplora pages, one row per counterparty so a batch payout becomes N edges),
+ * Solana via `getSignaturesForAddress` enriched with `solEnrichHistory` for
+ * the newest signatures; labels from the registry (+ sanctions); contract
+ * detection via `eth_getCode` (cached); prices from DefiLlama through
+ * `prefetchPrices`.
  */
 export function createDefaultFlowProvider(): DefaultFlowProvider {
   const priceMap = new Map<string, number>();
   const contractCache = new Map<string, Promise<boolean>>();
-  const solTxCache = new Map<string, Promise<Transaction[]>>();
+  const solRowsCache = new Map<string, Promise<TxListItem[]>>();
 
   const priceMapKey = (chain: ChainId, token?: string): string => {
     const t = (token ?? '').trim();
@@ -664,33 +642,26 @@ export function createDefaultFlowProvider(): DefaultFlowProvider {
 
   async function btcHistory(address: string, kind: 'tx' | 'token', signal?: AbortSignal): Promise<TxListItem[]> {
     if (kind === 'token') return [];
-    return (await btcAddressTxs(address, undefined, signal)).items;
+    return btcHistoryDetailed(address, { pages: DEFAULT_BTC_PAGES, signal });
   }
 
-  function solEnriched(address: string, signal?: AbortSignal): Promise<Transaction[]> {
-    const cached = solTxCache.get(address);
+  /** Signature page + enrichment, shared by the `tx` and `token` kinds of one node. */
+  function solEnrichedRows(address: string, signal?: AbortSignal): Promise<TxListItem[]> {
+    const cached = solRowsCache.get(address);
     if (cached) return cached;
     const p = (async () => {
       const page = await solSignatures(address, undefined, SOL_SIGNATURE_PAGE, signal);
-      const sigs = page.items.filter((i) => i.status !== 'failed').slice(0, SOL_ENRICH_LIMIT);
-      const txs = await mapLimit(sigs, SOL_ENRICH_CONCURRENCY, async (item): Promise<Transaction | undefined> => {
-        try {
-          return await solTransaction(item.hash, signal);
-        } catch (err) {
-          if (isAbort(err, signal)) throw err;
-          console.warn(`[trace] Solana transaction ${shorten(item.hash, 8, 8)} could not be loaded:`, errorMessage(err));
-          return undefined;
-        }
-      });
-      return txs.filter((t): t is Transaction => t !== undefined);
+      return solEnrichHistory(address, page.items, { limit: SOL_ENRICH_LIMIT, concurrency: SOL_ENRICH_CONCURRENCY, signal });
     })();
-    solTxCache.set(address, p);
-    p.catch(() => solTxCache.delete(address));
+    solRowsCache.set(address, p);
+    p.catch(() => solRowsCache.delete(address));
     return p;
   }
 
   async function solHistory(address: string, kind: 'tx' | 'token', signal?: AbortSignal): Promise<TxListItem[]> {
-    return solTransfersToRows(await solEnriched(address, signal), address, kind);
+    const rows = await solEnrichedRows(address, signal);
+    // Signature-only rows (not enriched) carry no counterparty and are dropped by the tracer anyway.
+    return rows.filter((r) => r.enriched && (kind === 'token' ? !!r.token : !r.token));
   }
 
   return {

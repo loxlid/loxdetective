@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encodeAbiParameters, maxUint256 } from 'viem';
 import { getChain } from '@/lib/chains/registry';
 import { useSettings } from '@/lib/settings/store';
+import { clearEndpointCooldowns } from '@/lib/http';
 import * as etherscan from '@/lib/providers/evm/etherscan';
 import { SLOT_EIP1967_IMPLEMENTATION, TOPIC_APPROVAL, TOPIC_APPROVAL_FOR_ALL, TOPIC_TRANSFER } from '@/lib/providers/evm/decode';
 import {
@@ -10,6 +11,7 @@ import {
   getAddressSummary,
   getApprovals,
   getContractInfo,
+  scanApprovals,
   getTokenBalances,
   getTransactionFull,
 } from '@/lib/providers/evm/index';
@@ -93,6 +95,7 @@ function erc20CallHandler(meta: Record<string, { name: string; symbol: string; d
 beforeEach(() => {
   useSettings.getState().reset();
   clearTokenMetaCache();
+  clearEndpointCooldowns();
   vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
@@ -646,5 +649,107 @@ describe('getApprovals', () => {
     await expect(getApprovals(ETH, OWNER)).resolves.toEqual([]);
     expect(ranges).toEqual([]);
     expect(rpcCalls(fetchMock, 'eth_getLogs')).toHaveLength(4);
+  });
+});
+
+describe('scanApprovals', () => {
+  const LATEST = 3_000_000;
+  const approvalLog = (token: string, spender: string, amount: bigint, block: number, idx: number) => ({
+    address: token.toLowerCase(),
+    topics: [TOPIC_APPROVAL, pad32(OWNER), pad32(spender)],
+    data: uint(amount),
+    blockNumber: `0x${block.toString(16)}`,
+    transactionHash: HASH,
+    logIndex: `0x${idx.toString(16)}`,
+  });
+  const logs = [approvalLog(USDC, SPENDER, 1_000n, 1_200_000, 1), approvalLog(DAI, OTHER, 500n, 2_900_000, 1)];
+  const meta = erc20CallHandler({
+    [USDC.toLowerCase()]: { name: 'USD Coin', symbol: 'USDC', decimals: 6 },
+    [DAI.toLowerCase()]: { name: 'Dai', symbol: 'DAI', decimals: 18 },
+  });
+
+  /** eth_getLogs responder: refuses ranges wider than `maxRange` and, when set, any range starting at or above `refuseFrom`. */
+  function rpcWithLogs(opts: { maxRange: number; refuseFrom?: number; blockNumberFails?: boolean }) {
+    const ranges: [number, number][] = [];
+    const handler = (req: RpcReq): unknown => {
+      switch (req.method) {
+        case 'eth_blockNumber':
+          return opts.blockNumberFails ? new Fail(503) : `0x${LATEST.toString(16)}`;
+        case 'eth_getLogs': {
+          const f = req.params[0] as { fromBlock: string; toBlock: string };
+          const from = Number(f.fromBlock);
+          const to = Number(f.toBlock);
+          if (to - from + 1 > opts.maxRange) return { error: { code: -32005, message: 'query exceeds max block range' } };
+          if (opts.refuseFrom !== undefined && from >= opts.refuseFrom) return { error: { code: -32000, message: 'request timed out upstream' } };
+          ranges.push([from, to]);
+          return logs.filter((l) => Number(l.blockNumber) >= from && Number(l.blockNumber) <= to);
+        }
+        case 'eth_getBlockByNumber':
+          return { number: req.params[0], timestamp: `0x${(1_700_000_000 + Number(req.params[0])).toString(16)}`, transactions: [] };
+        case 'eth_call':
+          return meta(req);
+        default:
+          return null;
+      }
+    };
+    return { handler, ranges };
+  }
+
+  it('reports a complete scan with the block span it covered', async () => {
+    installFetch(rpcWithLogs({ maxRange: 10_000_000 }).handler);
+    const scan = await scanApprovals(ETH, OWNER);
+    expect(scan.scanIncomplete).toBe(false);
+    expect(scan.reason).toBeUndefined();
+    expect(scan.fromBlock).toBe(LATEST - 2_000_000);
+    expect(scan.toBlock).toBe(LATEST);
+    expect(scan.approvals.map((a) => a.token.symbol)).toEqual(['DAI', 'USDC']);
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
+  it('flags the scan incomplete with a readable reason when eth_getLogs is refused outright', async () => {
+    const fetchMock = installFetch(rpcWithLogs({ maxRange: 10 }).handler);
+    const scan = await scanApprovals(BASE, OWNER);
+    expect(scan.approvals).toEqual([]);
+    expect(scan.scanIncomplete).toBe(true);
+    expect(scan.reason).toMatch(/Base RPC refused the approval log query \(query exceeds max block range\)/);
+    expect(scan.reason).toMatch(/blocks 1,000,000–3,000,000 were not scanned/);
+    expect(scan.fromBlock).toBe(LATEST - 2_000_000);
+    expect(scan.toBlock).toBe(LATEST);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringMatching(/approval scan incomplete on base/));
+    // Still fail fast: 1 wide + the first chunk, each on 2 endpoints.
+    expect(rpcCalls(fetchMock, 'eth_getLogs')).toHaveLength(4);
+    // The thin wrapper keeps its old contract.
+    expect(await getApprovals(BASE, OWNER)).toEqual([]);
+  });
+
+  it('keeps the approvals from the chunks that succeeded when a later chunk fails', async () => {
+    const { handler, ranges } = rpcWithLogs({ maxRange: 500_000, refuseFrom: 2_200_000 });
+    installFetch(handler);
+    const scan = await scanApprovals(ETH, OWNER);
+    // Wide request refused, then chunks 1–3 succeed and chunk 4 (from 2,200,003) fails → stop.
+    expect(ranges).toHaveLength(3);
+    expect(ranges[0][0]).toBe(LATEST - 2_000_000);
+    expect(scan.scanIncomplete).toBe(true);
+    expect(scan.reason).toMatch(/request timed out upstream/);
+    expect(scan.reason).toMatch(/blocks 2,200,003–3,000,000 were not scanned/);
+    // USDC (block 1.2M) was inside a scanned chunk; DAI (block 2.9M) was not.
+    expect(scan.approvals.map((a) => a.token.symbol)).toEqual(['USDC']);
+    expect(scan.approvals[0]).toMatchObject({ spender: SPENDER, amount: 1_000n, unlimited: false, blockNumber: 1_200_000 });
+  });
+
+  it('throws when the RPC itself is down (eth_blockNumber fails)', async () => {
+    installFetch(rpcWithLogs({ maxRange: 10_000_000, blockNumberFails: true }).handler);
+    await expect(scanApprovals(ETH, OWNER)).rejects.toThrow(/HTTP 503/);
+    await expect(getApprovals(ETH, OWNER)).rejects.toThrow(/HTTP 503/);
+  });
+
+  it('rethrows an abort instead of reporting an incomplete scan', async () => {
+    const ctrl = new AbortController();
+    installFetch((req) => {
+      if (req.method === 'eth_blockNumber') return `0x${LATEST.toString(16)}`;
+      ctrl.abort(new Error('cancelled'));
+      return { error: { code: -32005, message: 'query exceeds max block range' } };
+    });
+    await expect(scanApprovals(ETH, OWNER, ctrl.signal)).rejects.toThrow('cancelled');
   });
 });

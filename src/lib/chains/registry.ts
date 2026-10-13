@@ -149,7 +149,7 @@ export const CHAINS: ChainInfo[] = [
     'https://celo-rpc.publicnode.com',
   ], { blockscoutUrl: 'https://celo.blockscout.com', explorerName: 'Celoscan', explorerUrl: 'https://celoscan.io', color: '#fcff52', blockTimeSec: 5 }),
 
-  evm('fantom', 'Fantom Opera', 'FTM', 250, 'FTM', 'coingecko:fantom', [
+  evm('fantom', 'Fantom Opera (legacy)', 'FTM', 250, 'FTM', 'coingecko:fantom', [
     'https://rpc.ftm.tools',
     'https://fantom-rpc.publicnode.com',
     'https://1rpc.io/ftm',
@@ -242,3 +242,24 @@ export function allChains(includeTestnets = false): ChainInfo[] {
 }
 
 export const DEFAULT_EVM_CHAIN: ChainId = 'ethereum';
+
+/** Where address history comes from for a chain, in the order the EVM façade prefers them. */
+export type HistorySource = 'blockscout' | 'etherscan-key' | 'routescan' | 'esplora' | 'solana-rpc';
+
+/**
+ * Which backend serves address history: Blockscout when an instance exists,
+ * otherwise the Etherscan-compatible API (keyless Routescan or key-gated
+ * Etherscan V2); Bitcoin uses Esplora and Solana its own RPC.
+ */
+export function historySource(chain: ChainInfo): HistorySource {
+  if (chain.family === 'bitcoin') return 'esplora';
+  if (chain.family === 'solana') return 'solana-rpc';
+  if (chain.blockscoutUrl) return 'blockscout';
+  if (chain.etherscanApi && !chain.etherscanApi.requiresKey) return 'routescan';
+  return 'etherscan-key';
+}
+
+/** True when history is only available through a key-gated Etherscan API (no Blockscout instance). */
+export function historyNeedsKey(chain: ChainInfo): boolean {
+  return !chain.blockscoutUrl && chain.etherscanApi?.requiresKey === true;
+}

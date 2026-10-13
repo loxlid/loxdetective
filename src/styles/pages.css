@@ -152,3 +152,35 @@ pre.code--tall { max-height: 420px; }
 .node-list__hop { font-size: 0.7rem; color: var(--text-faint); white-space: nowrap; }
 .summary-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
 .summary-grid .card { margin-bottom: 0; }
+
+/* ---------- Address page: activity strip, callouts, notices, counterparties, UTXOs ---------- */
+.activity-tile__txs { font-size: 0.78rem; color: var(--text-muted); font-family: var(--font-mono); }
+.balance-tile.is-failed { opacity: 0.55; border-style: dashed; }
+.callout {
+  display: block; margin: 0 0 14px; padding: 9px 12px; font-size: 0.9rem;
+  border: 1px solid var(--border); border-left: 3px solid var(--info); border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--info) 8%, var(--bg-elev));
+}
+.callout a { font-weight: 600; }
+.notice {
+  display: flex; align-items: center; gap: 8px; margin: 0 0 12px; padding: 8px 12px; font-size: 0.88rem;
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, var(--border)); border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-elev)); color: var(--text);
+}
+.notice__icon { display: inline-flex; color: var(--warn); flex: none; }
+.notice__icon svg { width: 14px; height: 14px; }
+.banner {
+  margin: 12px 14px 0; padding: 10px 12px; font-size: 0.88rem; line-height: 1.45;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--border)); border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--warn) 10%, var(--bg-elev));
+}
+.banner strong { color: var(--warn); }
+.card--flush .banner + .table-wrap .table-scroll { margin-top: 10px; }
+.flag-notes { list-style: none; margin: 10px 0 0; padding: 8px 10px; font-size: 0.82rem; color: var(--text-muted); border-top: 1px dashed var(--border); }
+.flag-notes li::before { content: '⚠ '; color: var(--warn); }
+.risk-toggle__note { color: var(--warn); }
+.load-more__hint { color: var(--text-faint); font-style: italic; }
+.btn-row--inline { display: inline-flex; margin: 0; gap: 4px; }
+.approvals-span { font-family: var(--font-mono); color: var(--text-muted); }
+.mt-sm { margin-top: 12px; }
+.mt-sm .table-wrap .empty { padding: 14px 10px; }

@@ -19,8 +19,8 @@ import {
   type Hex,
 } from 'viem';
 import { normalize } from 'viem/ens';
-import type { ChainInfo, NativeBalance, TokenInfo } from '@/lib/types';
-import { jsonRpc, mapLimit, withFallback, RpcError } from '@/lib/http';
+import type { ChainActivity, ChainInfo, NativeBalance, TokenInfo } from '@/lib/types';
+import { jsonRpc, jsonRpcBatch, mapLimit, orderByCooldown, withFallback, RpcError } from '@/lib/http';
 import { rpcUrlsFor } from '@/lib/settings/store';
 import { getChain } from '@/lib/chains/registry';
 import { shorten } from '@/lib/format';
@@ -108,6 +108,8 @@ export interface RawEvmBlock {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_TIMEOUT_MS = 12_000;
+/** Per-request timeout for multi-chain probes (balances, activity, tx lookup), where many chains are hit at once. */
+export const PROBE_TIMEOUT_MS = 6_000;
 
 export interface RpcCallOptions {
   signal?: AbortSignal;
@@ -141,7 +143,8 @@ export function errorMessage(err: unknown): string {
 
 /** One JSON-RPC call with ordered endpoint fallback. */
 export async function rpcCall<T>(chain: ChainInfo, method: string, params: unknown[] = [], opts: RpcCallOptions = {}): Promise<T> {
-  let urls = rpcUrlsFor(chain);
+  // Pick the first N *healthy* endpoints so a cooled-down one does not eat the fan-out budget.
+  let urls = orderByCooldown(rpcUrlsFor(chain));
   if (opts.maxUrls !== undefined) urls = urls.slice(0, Math.max(1, opts.maxUrls));
   const outcome = await withFallback<Outcome<T>>(
     urls,
@@ -208,16 +211,26 @@ export async function getBlockNumber(chain: ChainInfo, signal?: AbortSignal): Pr
   return n;
 }
 
+function emptyBalance(chain: ChainInfo): NativeBalance {
+  return { chain: chain.id, balance: 0n, decimals: chain.native.decimals, symbol: chain.native.symbol };
+}
+
+function parseBalance(chain: ChainInfo, hex: unknown): NativeBalance {
+  if (typeof hex !== 'string') throw new Error('Malformed eth_getBalance response');
+  return { ...emptyBalance(chain), balance: hexToBigIntSafe(hex) };
+}
+
+async function nativeBalanceCall(chain: ChainInfo, address: string, opts: RpcCallOptions): Promise<NativeBalance> {
+  try {
+    return parseBalance(chain, await rpcCall<string>(chain, 'eth_getBalance', [address, 'latest'], opts));
+  } catch (err) {
+    return { ...emptyBalance(chain), error: errorMessage(err) };
+  }
+}
+
 /** Native balance; never throws — RPC failures are reported through `error`. */
 export async function getNativeBalance(chain: ChainInfo, address: string, signal?: AbortSignal): Promise<NativeBalance> {
-  const base: NativeBalance = { chain: chain.id, balance: 0n, decimals: chain.native.decimals, symbol: chain.native.symbol };
-  try {
-    const hex = await rpcCall<string>(chain, 'eth_getBalance', [address, 'latest'], { signal });
-    if (typeof hex !== 'string') throw new Error('Malformed eth_getBalance response');
-    return { ...base, balance: hexToBigIntSafe(hex) };
-  } catch (err) {
-    return { ...base, error: errorMessage(err) };
-  }
+  return nativeBalanceCall(chain, address, { signal });
 }
 
 /** Deployed bytecode; `'0x'` for an EOA. */
@@ -232,9 +245,13 @@ export async function getTransactionCount(chain: ChainInfo, address: string, sig
   return hexToNumberSafe(hex) ?? 0;
 }
 
-export async function getTransaction(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<RawEvmTx | null> {
-  const tx = await rpcCall<RawEvmTx | null>(chain, 'eth_getTransactionByHash', [hash], { signal });
+async function transactionCall(chain: ChainInfo, hash: string, opts: RpcCallOptions): Promise<RawEvmTx | null> {
+  const tx = await rpcCall<RawEvmTx | null>(chain, 'eth_getTransactionByHash', [hash], opts);
   return tx && typeof tx === 'object' && typeof tx.hash === 'string' ? tx : null;
+}
+
+export async function getTransaction(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<RawEvmTx | null> {
+  return transactionCall(chain, hash, { signal });
 }
 
 export async function getTransactionReceipt(chain: ChainInfo, hash: string, signal?: AbortSignal): Promise<RawEvmReceipt | null> {
@@ -372,21 +389,82 @@ export async function lookupEnsName(address: string, signal?: AbortSignal): Prom
 // Multi-chain helpers
 // ---------------------------------------------------------------------------
 
-/** Native balances across chains (6 in flight). Never rejects; failures set `error`. */
+/** Native balances across chains (6 in flight, {@link PROBE_TIMEOUT_MS} per request). Never rejects; failures set `error`. */
 export async function multiChainBalances(chains: ChainInfo[], address: string, signal?: AbortSignal): Promise<NativeBalance[]> {
   return mapLimit(chains, 6, async (chain) => {
     try {
-      return await getNativeBalance(chain, address, signal);
+      return await nativeBalanceCall(chain, address, { signal, timeoutMs: PROBE_TIMEOUT_MS });
     } catch (err) {
-      return { chain: chain.id, balance: 0n, decimals: chain.native.decimals, symbol: chain.native.symbol, error: errorMessage(err) };
+      return { ...emptyBalance(chain), error: errorMessage(err) };
     }
   });
 }
 
 /**
- * Probe every chain with eth_getTransactionByHash (8 in flight) and resolve
- * with the first chain that knows the hash. RPC failures count as "not found"
- * for that chain; remaining probes are cancelled once a hit is found.
+ * Balance + nonce on one chain as a single JSON-RPC batch with endpoint
+ * fallback. An endpoint that answers neither entry (batches unsupported,
+ * malformed envelope) is skipped like a transport failure; a partial answer
+ * is kept as is.
+ */
+async function chainActivityCall(chain: ChainInfo, address: string, signal?: AbortSignal): Promise<ChainActivity> {
+  const results = await withFallback(
+    rpcUrlsFor(chain),
+    async (url) => {
+      const out = await jsonRpcBatch(
+        url,
+        [
+          { method: 'eth_getBalance', params: [address, 'latest'] },
+          { method: 'eth_getTransactionCount', params: [address, 'latest'] },
+        ],
+        { signal, timeoutMs: PROBE_TIMEOUT_MS },
+      );
+      const failed = out.filter((r): r is RpcError => r instanceof RpcError);
+      if (failed.length === out.length) throw failed[0];
+      return out;
+    },
+    { signal },
+  );
+  const [balanceRes, countRes] = results;
+  const activity: ChainActivity = { chain: chain.id };
+  const errors: string[] = [];
+  if (balanceRes instanceof RpcError) errors.push(`eth_getBalance: ${balanceRes.message}`);
+  else {
+    try {
+      activity.balance = parseBalance(chain, balanceRes);
+    } catch (err) {
+      errors.push(errorMessage(err));
+    }
+  }
+  if (countRes instanceof RpcError) errors.push(`eth_getTransactionCount: ${countRes.message}`);
+  else {
+    const n = hexToNumberSafe(typeof countRes === 'string' ? countRes : undefined);
+    if (n === undefined) errors.push('Malformed eth_getTransactionCount response');
+    else activity.txCount = n;
+  }
+  if (errors.length > 0) activity.error = errors.join('; ');
+  return activity;
+}
+
+/**
+ * Native balance + transaction count for `address` on every chain (6 in
+ * flight, one JSON-RPC batch per chain, {@link PROBE_TIMEOUT_MS} per request).
+ * Never rejects: a chain whose RPCs all fail carries `error` only.
+ */
+export async function multiChainActivity(chains: ChainInfo[], address: string, signal?: AbortSignal): Promise<ChainActivity[]> {
+  return mapLimit(chains, 6, async (chain) => {
+    try {
+      return await chainActivityCall(chain, address, signal);
+    } catch (err) {
+      return { chain: chain.id, error: errorMessage(err) };
+    }
+  });
+}
+
+/**
+ * Probe every chain with eth_getTransactionByHash (8 in flight,
+ * {@link PROBE_TIMEOUT_MS} per request) and resolve with the first chain
+ * that knows the hash. RPC failures count as "not found" for that chain;
+ * remaining probes are cancelled once a hit is found.
  */
 export function findTxChain(chains: ChainInfo[], hash: string, signal?: AbortSignal): Promise<ChainInfo | null> {
   return new Promise<ChainInfo | null>((resolve, reject) => {
@@ -411,7 +489,7 @@ export function findTxChain(chains: ChainInfo[], hash: string, signal?: AbortSig
     void mapLimit(chains, 8, async (chain) => {
       if (settled) return;
       try {
-        const tx = await getTransaction(chain, hash, ctrl.signal);
+        const tx = await transactionCall(chain, hash, { signal: ctrl.signal, timeoutMs: PROBE_TIMEOUT_MS });
         if (tx) finish(chain);
       } catch {
         /* unreachable RPC or malformed reply: treat as not found on this chain */

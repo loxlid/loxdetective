@@ -174,9 +174,67 @@ export async function fetchJson<T = unknown>(url: string, opts: FetchJsonOptions
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+// ---------------------------------------------------------------------------
+// Endpoint cooldown
+// ---------------------------------------------------------------------------
+
+/** How long an endpoint is skipped after a transport-level failure. */
+export const COOLDOWN_MS = 60_000;
+
+/** url → epoch ms until which the endpoint is considered down. */
+const cooldowns = new Map<string, number>();
+
+/** Mark `url` as failed: later `withFallback` calls try it only as a last resort for {@link COOLDOWN_MS}. */
+export function markEndpointFailed(url: string, now = Date.now()): void {
+  cooldowns.set(url, now + COOLDOWN_MS);
+}
+
+/** True while `url` is inside its cooldown window. Expired entries are dropped lazily. */
+export function isEndpointCooling(url: string, now = Date.now()): boolean {
+  const until = cooldowns.get(url);
+  if (until === undefined) return false;
+  if (until <= now) {
+    cooldowns.delete(url);
+    return false;
+  }
+  return true;
+}
+
+/** Forget every cooldown (tests, "retry now" buttons). */
+export function clearEndpointCooldowns(): void {
+  cooldowns.clear();
+}
+
+/**
+ * Is `err` evidence that the *endpoint* is unhealthy (timeout, network error,
+ * HTTP 5xx / 429)? RPC-level errors (reverts, invalid params, malformed
+ * envelopes) describe the request, and an abort describes the caller, so
+ * neither should take the endpoint out of rotation.
+ */
+export function isEndpointFailure(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false;
+  if (err instanceof RpcError) return false;
+  if (err instanceof HttpError) return err.status === undefined || err.status >= 500 || err.status === 429;
+  if (err instanceof Error && err.name === 'AbortError') return false;
+  return true;
+}
+
+/** Healthy endpoints first (original order), then the cooled-down ones as a last resort (original order). */
+export function orderByCooldown(urls: readonly string[], now = Date.now()): string[] {
+  const healthy: string[] = [];
+  const cooling: string[] = [];
+  for (const u of urls) (isEndpointCooling(u, now) ? cooling : healthy).push(u);
+  return [...healthy, ...cooling];
+}
+
 /**
  * Try `fn` against each base URL in order until one succeeds. Throws the last
  * error if all fail. Useful for public RPC fallbacks.
+ *
+ * Endpoints that failed at the transport level (timeout, network error,
+ * HTTP 5xx / 429) within the last {@link COOLDOWN_MS} are moved to the back
+ * of the queue: healthy endpoints are tried first and a cooled-down one only
+ * when every healthy endpoint has failed. A success clears the cooldown.
  */
 export async function withFallback<T>(
   urls: readonly string[],
@@ -185,12 +243,15 @@ export async function withFallback<T>(
 ): Promise<T> {
   if (urls.length === 0) throw new Error('No endpoints configured');
   let lastErr: unknown;
-  for (const url of urls) {
+  for (const url of orderByCooldown(urls)) {
     if (opts.signal?.aborted) throw opts.signal.reason ?? new Error('aborted');
     try {
-      return await fn(url);
+      const value = await fn(url);
+      cooldowns.delete(url);
+      return value;
     } catch (err) {
       lastErr = err;
+      if (isEndpointFailure(err, opts.signal)) markEndpointFailed(url);
       opts.onError?.(url, err);
     }
   }
@@ -238,10 +299,12 @@ export async function jsonRpcBatch(
   if (calls.length === 0) return [];
   const reqs: JsonRpcRequest[] = calls.map((c) => ({ jsonrpc: '2.0', id: rpcId++, method: c.method, params: c.params ?? [] }));
   const res = await fetchJson<unknown>(url, { ...opts, method: 'POST', body: reqs });
-  const arr = Array.isArray(res) ? res : [res];
-  const byId = new Map<number, { result?: unknown; error?: { code: number; message: string; data?: unknown } }>();
-  for (const r of arr as { id: number; result?: unknown; error?: { code: number; message: string; data?: unknown } }[]) {
-    byId.set(r.id, r);
+  type BatchEntry = { id?: unknown; result?: unknown; error?: { code: number; message: string; data?: unknown } };
+  // An empty / null / non-object body (challenge page, proxy error) yields one 'missing batch response' per request.
+  const arr: unknown[] = Array.isArray(res) ? res : [res];
+  const byId = new Map<number, BatchEntry>();
+  for (const r of arr) {
+    if (r && typeof r === 'object' && typeof (r as BatchEntry).id === 'number') byId.set((r as BatchEntry).id as number, r as BatchEntry);
   }
   return reqs.map((r) => {
     const hit = byId.get(r.id);

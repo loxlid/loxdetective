@@ -37,6 +37,13 @@ Exact list (28): `search-input`, `search-submit`, `nav-home`, `nav-cases`,
 `case-note-input`, `settings-page`, `settings-rpc-ethereum`,
 `settings-etherscan-key`, `settings-save`, `risk-badge`, `flow-graph`.
 
+Additive ids (round 2; same rules, used by the newer smoke tests and the unit
+tests, listed in [Additive ids](#additive-ids-round-2) below): `address-activity-strip`,
+`address-active-elsewhere`, `address-key-notice`, `address-utxos`,
+`approvals-incomplete`, `trace-max-hops`, `trace-max-fanout`,
+`trace-save-case`, `case-attachment`, `case-attachment-stats`,
+`case-attachment-open`, `settings-alchemy-key`.
+
 ### Global layout
 
 | testid | Element | Contract |
@@ -120,6 +127,32 @@ fill `case-note-input` with `hello` → click `case-add-note` → reload → bot
 Test flow: fill `settings-rpc-ethereum` with `https://example-rpc.test` → click
 `settings-save` → `localStorage['loxdetective.settings.v1']` contains that URL →
 reload → the textarea's value still contains the URL.
+
+## Additive ids (round 2)
+
+These ids were added with the round-2 features. They follow the same rules as
+the core list (one element at a time, on the element the test touches).
+
+| testid | Element | Contract |
+| --- | --- | --- |
+| `address-activity-strip` | The "Activity across EVM chains" card on the EVM Overview tab | Present as soon as the Overview renders for an EVM address. Once the multi-chain probe settles it contains one `a.activity-tile` per EVM mainnet (testnets when enabled), each with the native balance, USD when priced, and `n txs` (`.activity-tile__txs`) from the batched `eth_getBalance` / `eth_getTransactionCount` answers; the current chain's tile carries `is-current`, failed probes `is-failed`. Its text contains `Active on X of Y chains`. |
+| `address-active-elsewhere` | `<p role="status">` above the Overview card | Rendered only when the address is an idle EOA on the current chain (nonce 0, zero balance) and active on another EVM chain; links to each active chain's profile. |
+| `address-key-notice` | `<p role="status">` above the tabs | Rendered on chains whose history needs an Etherscan API key while none is set; links to Settings. |
+| `address-utxos` | The UTXO card on the Bitcoin Overview tab | Count, confirmed count, total BTC (+ USD) and the top-10 unspent outputs. |
+| `approvals-incomplete` | `<div role="alert">` at the top of the Approvals tab | Rendered only when `scanApprovals` reported `scanIncomplete`; its text contains the RPC's reason and `were not scanned`, and it links to `/#/settings`. The `address-tab-approvals` counter then reads `n+` with a "lower bound" title. |
+| `trace-max-hops`, `trace-max-fanout` | `<input type="number">` of the trace form | Reflect the hops / fan-out options; prefilled from the `hops=` / `fanout=` query string of a saved trace. |
+| `trace-save-case` | `<button>` on the Trace page | Disabled until a graph exists. Saves the graph JSON plus the options it ran with to the active case (an inline picker when several exist); creates `New case` when there is none. Shows a toast `Trace saved to "<case>"`. |
+| `case-attachment` | `<li>` per saved trace in the "Saved traces" card of the selected case | Text contains the attachment title (`<Chain> trace of 0x1234…abcd · n hops, …`). |
+| `case-attachment-stats` | Element inside the row | Text contains `n addresses · m edges` (or `1 address`) and the options summary (`2 hops · fan-out 8 · …`). |
+| `case-attachment-open` | `<a>` inside the row | Links to `/#/trace/:chain/:root?hops=&fanout=&direction=&stop=&minUsd=&tokens=`; the Trace page prefills its form from that query string. |
+| `settings-alchemy-key` | `<input>` for the Alchemy API key | Reflects `settings.alchemyApiKey`. |
+
+Smoke flows added with these ids: the address Overview shows the activity
+strip from the mocked batch (`eth_getTransactionCount` = `0x5` → `5 txs` on
+every tile); the Approvals tab shows `approvals-incomplete` when `eth_getLogs`
+answers with a JSON-RPC error (`overrideRpc(page, rpcErrorFor('eth_getLogs', …))`
+in `e2e/mocks.ts`); a trace is saved with `trace-save-case`, listed as
+`case-attachment` on the Cases page and reopened through `case-attachment-open`.
 
 ## Console hygiene
 

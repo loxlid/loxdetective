@@ -8,9 +8,9 @@
  * the end that none occurred (resource 404s and favicon noise are tolerated).
  *
  * The data-testids used here are the UI contract documented in
- * docs/UI_TESTIDS.md.
+ * docs/UI_TESTIDS.md (the 28 core ids plus the additive round-2 ids).
  */
-import { ADDRESS, CASES_KEY, CUSTOM_RPC, escapeRegExp, expect, expectNoConsoleErrors, hashRoute, LOAD_TIMEOUT, SETTINGS_KEY, test, TX_HASH } from './mocks';
+import { ADDRESS, CASES_KEY, CUSTOM_RPC, escapeRegExp, EVM_MAINNET_CHAINS, expect, expectNoConsoleErrors, hashRoute, LOAD_TIMEOUT, overrideRpc, rpcErrorFor, SETTINGS_KEY, test, TX_HASH } from './mocks';
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -101,6 +101,88 @@ test.describe('LoxDetective smoke', () => {
     await page.reload();
     await expect(casesPage).toContainText('Test case', { timeout: LOAD_TIMEOUT });
     await expect(casesPage).toContainText('hello');
+    expectNoConsoleErrors(consoleErrors);
+  });
+
+  test('address overview probes every EVM chain and shows the mocked activity', async ({ page, consoleErrors }) => {
+    await page.goto(hashRoute(`/address/ethereum/${ADDRESS}`));
+    const strip = page.getByTestId('address-activity-strip');
+    await expect(strip).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    // One tile per EVM mainnet, each answered by the batched [eth_getBalance, eth_getTransactionCount] fixture (1 native unit, nonce 0x5).
+    const tiles = strip.locator('.activity-tile');
+    const total = EVM_MAINNET_CHAINS.length;
+    await expect(tiles).toHaveCount(total, { timeout: LOAD_TIMEOUT });
+    await expect(strip.locator('.activity-tile__txs')).toHaveText(Array<string>(total).fill('5 txs'), { timeout: LOAD_TIMEOUT });
+    await expect(strip).toContainText(`Active on ${total} of ${total} chains`);
+    await expect(strip).toContainText('in native balances');
+
+    // The Ethereum tile is the current chain, carries the mocked balance and its DefiLlama USD value.
+    const ethereum = strip.locator('.activity-tile.is-current');
+    await expect(ethereum).toHaveCount(1);
+    await expect(ethereum).toContainText('1 ETH');
+    await expect(ethereum).toContainText('$2,500');
+    await expect(ethereum).toHaveAttribute('href', new RegExp(`#/address/ethereum/${ADDRESS}`, 'i'));
+    await expect(strip.locator('.activity-tile.is-failed')).toHaveCount(0);
+    // Active everywhere, so the "active elsewhere" callout stays hidden.
+    await expect(page.getByTestId('address-active-elsewhere')).toHaveCount(0);
+    expectNoConsoleErrors(consoleErrors);
+  });
+
+  test('approvals tab warns when the RPC refuses the approval log query', async ({ page, consoleErrors }) => {
+    await overrideRpc(page, rpcErrorFor('eth_getLogs', 'query exceeds max block range'));
+    await page.goto(hashRoute(`/address/ethereum/${ADDRESS}`));
+    await expect(page.getByTestId('address-native-balance')).toContainText('ETH', { timeout: LOAD_TIMEOUT });
+
+    const tab = page.getByTestId('address-tab-approvals');
+    await tab.click();
+    const banner = page.getByTestId('approvals-incomplete');
+    await expect(banner).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(banner).toHaveAttribute('role', 'alert');
+    await expect(banner).toContainText('Approval scan incomplete');
+    await expect(banner).toContainText('The Ethereum RPC refused the approval log query (query exceeds max block range)');
+    await expect(banner).toContainText('were not scanned');
+    await expect(banner.getByRole('link', { name: /custom RPC in Settings/i })).toHaveAttribute('href', /#\/settings$/);
+
+    // Partial result: the empty state says so and the tab counter is a lower bound.
+    await expect(page.getByText('No approvals in the scanned part')).toBeVisible();
+    await expect(tab).toContainText('0+');
+    await expect(tab).toHaveAttribute('title', /lower bound/i);
+    expectNoConsoleErrors(consoleErrors);
+  });
+
+  test('a trace can be saved to a case and reopened from the Cases page', async ({ page, consoleErrors }) => {
+    await page.goto(hashRoute(`/trace/ethereum/${ADDRESS}`));
+    await expect(page.getByTestId('trace-page')).toBeVisible({ timeout: LOAD_TIMEOUT });
+    const save = page.getByTestId('trace-save-case');
+    await expect(save).toBeDisabled();
+
+    await page.getByTestId('trace-run').click();
+    await expect(page.getByTestId('flow-graph')).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(page.getByTestId('trace-page')).toContainText(/Done:/, { timeout: LOAD_TIMEOUT });
+    await expect(save).toBeEnabled();
+
+    // No case exists yet: saving creates "New case" and stores the graph JSON with the options the trace ran with.
+    await save.click();
+    await expect(page.locator('.toast-stack')).toContainText('Trace saved to "New case"');
+    await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), CASES_KEY)).toContain('"kind":"trace"');
+
+    await page.goto(hashRoute('/cases'));
+    const casesPage = page.getByTestId('cases-page');
+    await expect(casesPage).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(casesPage).toContainText('New case');
+    const row = page.getByTestId('case-attachment');
+    await expect(row).toBeVisible();
+    await expect(row).toContainText(/Ethereum trace of 0x742d/i);
+    await expect(page.getByTestId('case-attachment-stats')).toContainText('1 address');
+    await expect(page.getByTestId('case-attachment-stats')).toContainText('2 hops');
+
+    // "Open trace" re-enters the tracer with the saved options in the query string.
+    await page.getByTestId('case-attachment-open').click();
+    await expect(page).toHaveURL(new RegExp(`#/trace/ethereum/${ADDRESS}\\?(?=.*hops=2)(?=.*fanout=8)(?=.*direction=both)`, 'i'), { timeout: LOAD_TIMEOUT });
+    await expect(page.getByTestId('trace-page')).toBeVisible();
+    await expect(page.getByTestId('trace-max-hops')).toHaveValue('2');
+    await expect(page.getByTestId('trace-max-fanout')).toHaveValue('8');
     expectNoConsoleErrors(consoleErrors);
   });
 });

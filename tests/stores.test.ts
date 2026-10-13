@@ -23,15 +23,18 @@ import { registerLabels, unregisterLabels } from '@/lib/intel/labels';
 import { getChain } from '@/lib/chains/registry';
 import {
   CASES_STORAGE_KEY,
+  CASE_ATTACHMENT_MAX_BYTES,
   CASE_EXPORT_FORMAT,
+  attachmentBytes,
   casesContaining,
   entityId,
   getActiveCase,
   isInCase,
   newId,
+  parseAttachment,
   useCases,
 } from '@/lib/cases/store';
-import { DEFAULT_SETTINGS, getSettings, rpcUrlsFor, sanitizeSettings, SETTINGS_STORAGE_KEY, useSettings } from '@/lib/settings/store';
+import { ALCHEMY_SLUGS, alchemyUrlFor, DEFAULT_SETTINGS, getSettings, rpcUrlsFor, sanitizeSettings, SETTINGS_STORAGE_KEY, useSettings } from '@/lib/settings/store';
 import type { InvestigationCase } from '@/lib/types';
 
 const registerLabelsMock = vi.mocked(registerLabels);
@@ -405,6 +408,46 @@ describe('cases: export / import', () => {
     expect(c.updatedAt).toBeGreaterThanOrEqual(c.createdAt);
   });
 
+  it('rolls back and reports a storage failure instead of keeping a phantom imported case', () => {
+    const original = seedCase();
+    const json = useCases.getState().exportCase(original.id);
+    registerLabelsMock.mockClear();
+    const setItem = localStorage.setItem;
+    let calls = 0;
+    localStorage.setItem = (k: string, v: string) => {
+      if (++calls === 1) throw new Error('QuotaExceededError');
+      setItem.call(localStorage, k, v);
+    };
+    try {
+      expect(() => useCases.getState().importCase(json)).toThrow(/^Could not import the case: browser storage is full/);
+    } finally {
+      localStorage.setItem = setItem;
+    }
+    // No phantom case in memory, nothing registered, storage still matches the state.
+    expect(useCases.getState().cases.map((c) => c.id)).toEqual([original.id]);
+    expect(registerLabelsMock).not.toHaveBeenCalled();
+    expect(stored(CASES_STORAGE_KEY)?.state.cases).toEqual(JSON.parse(JSON.stringify(useCases.getState().cases)));
+    // Once storage works again the same file imports normally.
+    expect(useCases.getState().importCase(json).title).toBe(original.title);
+    expect(useCases.getState().cases).toHaveLength(2);
+    expect(registerLabelsMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces the original storage error even when the rollback write fails too', () => {
+    const original = seedCase();
+    const json = useCases.getState().exportCase(original.id);
+    const setItem = localStorage.setItem;
+    localStorage.setItem = () => {
+      throw new Error('storage unavailable');
+    };
+    try {
+      expect(() => useCases.getState().importCase(json)).toThrow(/Could not import the case.*storage unavailable/);
+    } finally {
+      localStorage.setItem = setItem;
+    }
+    expect(useCases.getState().cases.map((c) => c.id)).toEqual([original.id]);
+  });
+
   it('throws Error("Invalid case file") for malformed input', () => {
     const bad = [
       'not json',
@@ -492,6 +535,146 @@ describe('cases: selectors', () => {
   });
 });
 
+describe('cases: attachments', () => {
+  const GRAPH_JSON = JSON.stringify({ format: 'loxdetective-flow', version: 1, graph: { root: EVM_ADDR.toLowerCase(), chain: 'ethereum', nodes: [{ id: EVM_ADDR.toLowerCase(), chain: 'ethereum', depth: 0 }], edges: [], truncated: [], stats: { hops: 2, txsScanned: 0, durationMs: 1 } } });
+  const OPTIONS = { maxHops: 2, maxFanOut: 8, direction: 'both' as const, stopAtLabelled: true, includeTokens: true, minUsd: 0 };
+  const newAttachment = (over: Partial<{ title: string; chain: string; root: string; options: typeof OPTIONS; data: string }> = {}) => ({
+    kind: 'trace' as const,
+    title: 'Trace of vitalik',
+    chain: 'ethereum',
+    root: EVM_ADDR,
+    options: OPTIONS,
+    data: GRAPH_JSON,
+    ...over,
+  });
+
+  it('adds attachments with id and createdAt, bumps updatedAt and omits the key while empty', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-13T10:00:00Z'));
+    const c = useCases.getState().createCase('A');
+    expect(c).not.toHaveProperty('attachments');
+    vi.setSystemTime(new Date('2026-10-13T11:00:00Z'));
+    const a = useCases.getState().addAttachment(c.id, newAttachment());
+    expect(a).toMatchObject({ kind: 'trace', title: 'Trace of vitalik', chain: 'ethereum', root: EVM_ADDR, options: OPTIONS, data: GRAPH_JSON, createdAt: Date.now() });
+    expect(a?.id).toMatch(/\S/);
+    const stored1 = useCases.getState().cases[0];
+    expect(stored1.attachments).toEqual([a]);
+    expect(stored1.updatedAt).toBe(Date.now());
+    // Two attachments with the same title are distinct entries.
+    const b = useCases.getState().addAttachment(c.id, newAttachment());
+    expect(b?.id).not.toBe(a?.id);
+    expect(useCases.getState().cases[0].attachments?.map((x) => x.id)).toEqual([a?.id, b?.id]);
+    expect(registerLabelsMock).not.toHaveBeenCalled();
+  });
+
+  it('returns undefined for unknown cases and throws for malformed or oversized attachments', () => {
+    const c = useCases.getState().createCase('A');
+    expect(useCases.getState().addAttachment('missing', newAttachment())).toBeUndefined();
+    expect(() => useCases.getState().addAttachment(c.id, newAttachment({ title: '  ' }))).toThrow('Invalid attachment');
+    expect(() => useCases.getState().addAttachment(c.id, newAttachment({ root: '' }))).toThrow('Invalid attachment');
+    expect(() => useCases.getState().addAttachment(c.id, { ...newAttachment(), options: { ...OPTIONS, direction: 'sideways' as 'both' } })).toThrow('Invalid attachment');
+    expect(() => useCases.getState().addAttachment(c.id, { ...newAttachment(), data: 42 as unknown as string })).toThrow('Invalid attachment');
+    expect(() => useCases.getState().addAttachment(c.id, newAttachment({ data: 'x'.repeat(CASE_ATTACHMENT_MAX_BYTES + 1) }))).toThrow(/too large/);
+    expect(useCases.getState().cases[0]).not.toHaveProperty('attachments');
+    // Exactly the cap is accepted.
+    expect(useCases.getState().addAttachment(c.id, newAttachment({ data: 'x'.repeat(CASE_ATTACHMENT_MAX_BYTES) }))).toBeDefined();
+  });
+
+  it('rolls back and reports a storage failure instead of keeping an unpersisted attachment', () => {
+    const c = useCases.getState().createCase('A');
+    const setItem = localStorage.setItem;
+    let calls = 0;
+    localStorage.setItem = (k: string, v: string) => {
+      if (++calls === 1) throw new Error('QuotaExceededError');
+      setItem.call(localStorage, k, v);
+    };
+    try {
+      expect(() => useCases.getState().addAttachment(c.id, newAttachment())).toThrow(/storage is full/);
+    } finally {
+      localStorage.setItem = setItem;
+    }
+    expect(useCases.getState().cases[0]).not.toHaveProperty('attachments');
+    expect(stored(CASES_STORAGE_KEY)?.state.cases).toEqual(JSON.parse(JSON.stringify(useCases.getState().cases)));
+  });
+
+  it('removes attachments by id and drops the key when the last one goes', () => {
+    const c = useCases.getState().createCase('A');
+    const a = useCases.getState().addAttachment(c.id, newAttachment())!;
+    const b = useCases.getState().addAttachment(c.id, newAttachment({ title: 'Second' }))!;
+    useCases.getState().removeAttachment(c.id, 'nope');
+    useCases.getState().removeAttachment('missing', a.id);
+    expect(useCases.getState().cases[0].attachments).toHaveLength(2);
+    useCases.getState().removeAttachment(c.id, a.id);
+    expect(useCases.getState().cases[0].attachments).toEqual([b]);
+    useCases.getState().removeAttachment(c.id, b.id);
+    expect(useCases.getState().cases[0]).not.toHaveProperty('attachments');
+    expect(Object.keys(useCases.getState().cases[0]).sort()).toEqual(['createdAt', 'entities', 'id', 'notes', 'title', 'updatedAt']);
+  });
+
+  it('export / import carry attachments, preserving ids, options and data', () => {
+    const c = useCases.getState().createCase('With trace');
+    const a = useCases.getState().addAttachment(c.id, newAttachment())!;
+    const json = useCases.getState().exportCase(c.id);
+    expect(JSON.parse(json).case.attachments).toEqual([a]);
+    const imported = useCases.getState().importCase(json);
+    expect(imported.attachments).toEqual([a]);
+    // Bare case object with attachments; duplicate ids are regenerated.
+    const bare = useCases.getState().importCase(JSON.stringify({ title: 'Bare', entities: [], attachments: [{ ...a, id: 'dup' }, { ...a, id: 'dup' }] }));
+    expect(bare.attachments).toHaveLength(2);
+    expect(bare.attachments?.[0].id).toBe('dup');
+    expect(bare.attachments?.[1].id).not.toBe('dup');
+    // An empty list imports as "no attachments".
+    expect(useCases.getState().importCase(JSON.stringify({ title: 'None', entities: [], attachments: [] }))).not.toHaveProperty('attachments');
+  });
+
+  it('rejects case files with malformed or oversized attachments', () => {
+    const base = { title: 'x', entities: [] };
+    const bad = [
+      { ...base, attachments: 'nope' },
+      { ...base, attachments: [null] },
+      { ...base, attachments: [{ ...newAttachment(), kind: 'image' }] },
+      { ...base, attachments: [{ ...newAttachment(), title: '' }] },
+      { ...base, attachments: [{ ...newAttachment(), chain: 7 }] },
+      { ...base, attachments: [{ ...newAttachment(), root: undefined }] },
+      { ...base, attachments: [{ ...newAttachment(), options: undefined }] },
+      { ...base, attachments: [{ ...newAttachment(), options: { ...OPTIONS, maxHops: '2' } }] },
+      { ...base, attachments: [{ ...newAttachment(), options: { ...OPTIONS, stopAtLabelled: 'yes' } }] },
+      { ...base, attachments: [{ ...newAttachment(), options: { ...OPTIONS, minUsd: 'free' } }] },
+      { ...base, attachments: [{ ...newAttachment(), data: { graph: {} } }] },
+      { ...base, attachments: [{ ...newAttachment(), data: 'x'.repeat(CASE_ATTACHMENT_MAX_BYTES + 1) }] },
+    ];
+    for (const file of bad) {
+      expect(() => useCases.getState().importCase(JSON.stringify(file)), JSON.stringify(file).slice(0, 200)).toThrow('Invalid case file');
+    }
+    expect(useCases.getState().cases).toEqual([]);
+  });
+
+  it('parseAttachment fills ids / timestamps, keeps optional minUsd absent and measures bytes in UTF-8', () => {
+    const { minUsd: _drop, ...noMin } = OPTIONS;
+    const parsed = parseAttachment({ ...newAttachment(), options: noMin }, 123);
+    expect(parsed).toMatchObject({ createdAt: 123, options: noMin });
+    expect(parsed?.options).not.toHaveProperty('minUsd');
+    expect(parsed?.id).toMatch(/\S/);
+    expect(parseAttachment({ ...newAttachment(), id: 'keep', createdAt: 5 })).toMatchObject({ id: 'keep', createdAt: 5 });
+    expect(parseAttachment('nope')).toBeUndefined();
+    expect(attachmentBytes('abc')).toBe(3);
+    expect(attachmentBytes('é')).toBe(2);
+  });
+
+  it('persists attachments and rehydrates them, dropping broken ones but keeping the case', async () => {
+    const c = useCases.getState().createCase('A');
+    const a = useCases.getState().addAttachment(c.id, newAttachment())!;
+    expect(stored(CASES_STORAGE_KEY)?.state.cases).toEqual(JSON.parse(JSON.stringify(useCases.getState().cases)));
+
+    const onDisk: InvestigationCase = { id: 'case-1', title: 'From disk', createdAt: 1, updatedAt: 2, entities: [], notes: [], attachments: [a, { ...a, id: 'broken', data: 5 as unknown as string }] };
+    localStorage.setItem(CASES_STORAGE_KEY, JSON.stringify({ state: { cases: [onDisk], activeCaseId: 'case-1' }, version: 1 }));
+    await useCases.persist.rehydrate();
+    expect(useCases.getState().cases).toHaveLength(1);
+    expect(useCases.getState().cases[0].attachments).toEqual([a]);
+    expect(useCases.getState().activeCaseId).toBe('case-1');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Settings store
 // ---------------------------------------------------------------------------
@@ -527,6 +710,58 @@ describe('settings store', () => {
     await useSettings.persist.rehydrate();
     expect(getSettings()).toMatchObject({ heliusApiKey: 'H', theme: 'light' });
     expect(rpcUrlsFor(getChain('solana'))[0]).toBe('https://sol.example');
+  });
+});
+
+describe('settings: Alchemy endpoints', () => {
+  it('maps every Alchemy-served chain to its network slug', () => {
+    expect(ALCHEMY_SLUGS).toEqual({
+      ethereum: 'eth-mainnet',
+      base: 'base-mainnet',
+      arbitrum: 'arb-mainnet',
+      optimism: 'opt-mainnet',
+      polygon: 'polygon-mainnet',
+      zksync: 'zksync-mainnet',
+      linea: 'linea-mainnet',
+      scroll: 'scroll-mainnet',
+      blast: 'blast-mainnet',
+      bsc: 'bnb-mainnet',
+      avalanche: 'avax-mainnet',
+      gnosis: 'gnosis-mainnet',
+      'polygon-zkevm': 'polygonzkevm-mainnet',
+      celo: 'celo-mainnet',
+      sepolia: 'eth-sepolia',
+    });
+  });
+
+  it('prepends the Alchemy URL for served chains when a key is set', () => {
+    useSettings.getState().set({ alchemyApiKey: 'KEY123' });
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(['https://eth-mainnet.g.alchemy.com/v2/KEY123', ...getChain('ethereum').rpcUrls]);
+    expect(rpcUrlsFor(getChain('polygon-zkevm'))[0]).toBe('https://polygonzkevm-mainnet.g.alchemy.com/v2/KEY123');
+    expect(rpcUrlsFor(getChain('sepolia'))[0]).toBe('https://eth-sepolia.g.alchemy.com/v2/KEY123');
+    expect(alchemyUrlFor(getChain('bsc'))).toBe('https://bnb-mainnet.g.alchemy.com/v2/KEY123');
+  });
+
+  it('leaves chains Alchemy does not serve untouched', () => {
+    useSettings.getState().set({ alchemyApiKey: 'KEY123' });
+    for (const id of ['mantle', 'fantom', 'cronos', 'moonbeam', 'bitcoin', 'solana']) {
+      expect(rpcUrlsFor(getChain(id))).toEqual(getChain(id).rpcUrls);
+      expect(alchemyUrlFor(getChain(id))).toBeUndefined();
+    }
+  });
+
+  it('orders custom RPCs first, then Alchemy, then the defaults, without duplicates', () => {
+    const alchemy = 'https://base-mainnet.g.alchemy.com/v2/KEY123';
+    useSettings.getState().set({ alchemyApiKey: 'KEY123', customRpc: { base: ['https://my.base.rpc', alchemy, getChain('base').rpcUrls[0]] } });
+    expect(rpcUrlsFor(getChain('base'))).toEqual(['https://my.base.rpc', alchemy, ...getChain('base').rpcUrls]);
+  });
+
+  it('ignores an empty or whitespace key and encodes unusual characters', () => {
+    useSettings.getState().set({ alchemyApiKey: '   ' });
+    expect(rpcUrlsFor(getChain('ethereum'))).toEqual(getChain('ethereum').rpcUrls);
+    useSettings.getState().set({ alchemyApiKey: undefined });
+    expect(alchemyUrlFor(getChain('ethereum'))).toBeUndefined();
+    expect(alchemyUrlFor(getChain('ethereum'), 'a b/c')).toBe('https://eth-mainnet.g.alchemy.com/v2/a%20b%2Fc');
   });
 });
 

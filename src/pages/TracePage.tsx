@@ -1,15 +1,20 @@
 /**
  * Fund-flow tracer (SPEC §6): options form, run / cancel with an
  * AbortController, live progress from `traceFunds`, the D3 `FlowGraph`,
- * a side panel for the selected node, summary lists and CSV / JSON export.
- * Nothing runs on mount; the last graph stays in component state.
+ * a side panel for the selected node, summary lists, CSV / JSON export and
+ * "Save trace to case" (a `CaseAttachment` holding the serialised graph).
+ * Nothing runs on mount; the last graph stays in component state. The form
+ * is prefilled from the query string (`?hops=&fanout=&direction=&stop=&minUsd=&tokens=`),
+ * which is how a saved trace is reopened from the Cases page.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import type { ChainInfo, FlowGraph as FlowGraphData, FlowNode, TraceOptions, Transfer } from '@/lib/types';
+import { Link, useLocation, useParams, useSearchParams } from 'react-router-dom';
+import type { CaseAttachment, ChainInfo, FlowGraph as FlowGraphData, FlowNode, TraceOptions, Transfer } from '@/lib/types';
 import { findChain } from '@/lib/chains/registry';
 import { isEvmAddress } from '@/lib/detect';
+import { downloadCsv, downloadJson, safeFilename } from '@/lib/export';
 import { formatAmount, formatUsd, shorten } from '@/lib/format';
+import { useCases } from '@/lib/cases/store';
 import { lookupLabel } from '@/lib/intel/labels';
 import { isSanctioned } from '@/lib/intel/sanctions';
 import { createDefaultFlowProvider, displayAddress, graphToCsv, graphToJson, riskFromLabel, summarizeGraph, traceFunds } from '@/lib/trace/flow';
@@ -55,16 +60,56 @@ function isAbort(err: unknown): boolean {
   return err instanceof Error && (err.name === 'AbortError' || /cancelled|aborted/i.test(err.message));
 }
 
-function download(filename: string, text: string, type: string): void {
-  if (typeof document === 'undefined') return;
-  const url = URL.createObjectURL(new Blob([text], { type }));
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+/** Trace options as they are stored in a case attachment (no signal / callback). */
+export type SavedTraceOptions = CaseAttachment['options'];
+
+/**
+ * Query string (without `?`) that reopens the tracer with these options:
+ * `hops`, `fanout`, `direction`, `stop` (1/0), `minUsd`, `tokens` (1/0).
+ */
+export function traceQueryFor(o: SavedTraceOptions): string {
+  const q = new URLSearchParams();
+  q.set('hops', String(o.maxHops));
+  q.set('fanout', String(o.maxFanOut));
+  q.set('direction', o.direction);
+  q.set('stop', o.stopAtLabelled ? '1' : '0');
+  q.set('minUsd', String(o.minUsd ?? 0));
+  q.set('tokens', o.includeTokens ? '1' : '0');
+  return q.toString();
+}
+
+function flag(value: string | null, fallback: boolean): boolean {
+  if (value === null) return fallback;
+  const v = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'off'].includes(v)) return false;
+  return fallback;
+}
+
+/**
+ * Form state from a query string (`?hops=3&fanout=5&direction=out&stop=0&minUsd=100&tokens=1`).
+ * Missing or invalid values fall back to `DEFAULT_TRACE_FORM`; numbers are clamped to their ranges.
+ */
+export function formFromSearch(search: string | URLSearchParams, base: TraceForm = DEFAULT_TRACE_FORM): TraceForm {
+  const q = typeof search === 'string' ? new URLSearchParams(search) : search;
+  const direction = q.get('direction');
+  // A missing or blank minUsd keeps the base value (Number('') would be 0).
+  const rawMinUsd = q.get('minUsd');
+  const minUsd = rawMinUsd === null || rawMinUsd.trim() === '' ? base.minUsd : Number(rawMinUsd);
+  return {
+    maxHops: clampInt(q.get('hops') ?? '', HOPS_RANGE[0], HOPS_RANGE[1], base.maxHops),
+    maxFanOut: clampInt(q.get('fanout') ?? '', FANOUT_RANGE[0], FANOUT_RANGE[1], base.maxFanOut),
+    direction: direction === 'in' || direction === 'out' || direction === 'both' ? direction : base.direction,
+    stopAtLabelled: flag(q.get('stop'), base.stopAtLabelled),
+    minUsd: Number.isFinite(minUsd) && minUsd >= 0 ? minUsd : base.minUsd,
+    includeTokens: flag(q.get('tokens'), base.includeTokens),
+  };
+}
+
+/** Default attachment title for a saved trace. */
+export function traceTitle(chainName: string, address: string, o: SavedTraceOptions): string {
+  const dir = o.direction === 'both' ? 'both ways' : o.direction === 'in' ? 'incoming' : 'outgoing';
+  return `${chainName} trace of ${shorten(address, 6, 4)} · ${o.maxHops} hop${o.maxHops === 1 ? '' : 's'}, ${dir}`;
 }
 
 /** "3 ETH · 50 USDC" — per-asset sums of a set of transfers (first four assets). */
@@ -89,6 +134,7 @@ function nodeTitle(graph: FlowGraphData, id: string): string {
 
 export default function TracePage() {
   const { chain = '', address = '' } = useParams();
+  const { search } = useLocation();
   const info = findChain(chain);
   const display = canonicalAddress(info, address);
   usePageTitle(info ? `Trace ${shorten(display, 8, 6)} · ${info.name}` : 'Trace funds');
@@ -98,7 +144,8 @@ export default function TracePage() {
       {error || !info ? (
         <ErrorBox title="Cannot trace this address" message={error ?? 'Unknown chain'} hint={<Link to="/">Back to search</Link>} />
       ) : (
-        <Tracer info={info} address={display} />
+        // Keyed so that navigating to another root or to a saved trace's options resets the form and the graph.
+        <Tracer key={`${info.id}:${display}:${search}`} info={info} address={display} />
       )}
     </div>
   );
@@ -108,11 +155,15 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
   const chain = info.id;
   const toast = useToast();
   const rootLabel = useLabel(address, chain);
-  const [form, setForm] = useState<TraceForm>(DEFAULT_TRACE_FORM);
+  const [searchParams] = useSearchParams();
+  // The query string (from a saved trace or a shared link) seeds the form once; later edits are local.
+  const [form, setForm] = useState<TraceForm>(() => formFromSearch(searchParams));
   // Numeric fields are kept as raw strings while editing and clamped on blur / run,
   // so clearing the field and retyping does not snap to the minimum mid-keystroke.
-  const [draft, setDraft] = useState({ maxHops: String(DEFAULT_TRACE_FORM.maxHops), maxFanOut: String(DEFAULT_TRACE_FORM.maxFanOut) });
+  const [draft, setDraft] = useState(() => ({ maxHops: String(form.maxHops), maxFanOut: String(form.maxFanOut) }));
   const [graph, setGraph] = useState<FlowGraphData>();
+  /** The options the current graph was produced with (what gets saved with it). */
+  const [ranWith, setRanWith] = useState<SavedTraceOptions>();
   const [progress, setProgress] = useState('');
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<Error>();
@@ -131,14 +182,26 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
     setSelected(undefined);
     setProgress('Starting trace…');
     const provider = createDefaultFlowProvider();
+    const options: SavedTraceOptions = {
+      ...form,
+      maxHops: clampInt(draft.maxHops, HOPS_RANGE[0], HOPS_RANGE[1], DEFAULT_TRACE_FORM.maxHops),
+      maxFanOut: clampInt(draft.maxFanOut, FANOUT_RANGE[0], FANOUT_RANGE[1], DEFAULT_TRACE_FORM.maxFanOut),
+    };
+    setRanWith(options);
+    // Mirror the options into the URL so the address bar can be copied as a shareable link.
+    // replaceState does not fire popstate, so HashRouter's location (and the Tracer key) is untouched and the graph survives.
+    if (typeof window !== 'undefined') {
+      const url = new URL(window.location.href);
+      const [path] = url.hash.split('?');
+      url.hash = `${path || `#/trace/${chain}/${address}`}?${traceQueryFor(options)}`;
+      window.history.replaceState(window.history.state, '', url);
+    }
     try {
       const result = await traceFunds(
         chain,
         address,
         {
-          ...form,
-          maxHops: clampInt(draft.maxHops, HOPS_RANGE[0], HOPS_RANGE[1], DEFAULT_TRACE_FORM.maxHops),
-          maxFanOut: clampInt(draft.maxFanOut, FANOUT_RANGE[0], FANOUT_RANGE[1], DEFAULT_TRACE_FORM.maxFanOut),
+          ...options,
           signal: controller.signal,
           onProgress: (msg, snapshot) => {
             if (controller.signal.aborted) return;
@@ -173,9 +236,9 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
 
   const exportAs = (kind: 'csv' | 'json') => {
     if (!graph) return;
-    const base = `loxdetective-trace-${chain}-${shorten(address, 6, 4).replace('…', '-')}`;
-    if (kind === 'csv') download(`${base}.csv`, graphToCsv(graph), 'text/csv');
-    else download(`${base}.json`, graphToJson(graph), 'application/json');
+    const base = safeFilename(`loxdetective-trace-${chain}-${shorten(address, 6, 4).replace('…', '-')}`);
+    if (kind === 'csv') downloadCsv(base, graphToCsv(graph));
+    else downloadJson(base, graphToJson(graph));
     toast.push(`Exported ${kind.toUpperCase()}`, 'success');
   };
 
@@ -270,6 +333,7 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
             <button type="button" className="btn btn--sm" onClick={() => exportAs('json')} disabled={!graph}>
               Export JSON
             </button>
+            <SaveTraceButton graph={running ? undefined : graph} chain={info} address={address} options={ranWith ?? form} />
           </div>
         </div>
         <div className="trace-progress" aria-live="polite">
@@ -315,6 +379,58 @@ function Tracer({ info, address }: { info: ChainInfo; address: string }) {
         </div>
       )}
     </>
+  );
+}
+
+/**
+ * Saves the finished graph into a case as a `trace` attachment. Targets the
+ * active case (or the one picked inline when several exist) and creates a
+ * case when none exists yet, mirroring `AddToCaseButton`.
+ */
+function SaveTraceButton({ graph, chain, address, options }: { graph?: FlowGraphData; chain: ChainInfo; address: string; options: SavedTraceOptions }) {
+  const cases = useCases((s) => s.cases);
+  const activeCaseId = useCases((s) => s.activeCaseId);
+  const createCase = useCases((s) => s.createCase);
+  const setActive = useCases((s) => s.setActive);
+  const addAttachment = useCases((s) => s.addAttachment);
+  const toast = useToast();
+  const [targetId, setTargetId] = useState<string | undefined>(activeCaseId ?? cases[0]?.id);
+  useEffect(() => {
+    if (!targetId || !cases.some((c) => c.id === targetId)) setTargetId(activeCaseId ?? cases[0]?.id);
+  }, [cases, activeCaseId, targetId]);
+
+  const save = () => {
+    if (!graph) return;
+    const attachment = { kind: 'trace' as const, title: traceTitle(chain.name, address, options), chain: chain.id, root: address, options, data: graphToJson(graph) };
+    try {
+      let target = cases.find((c) => c.id === targetId);
+      if (!target) {
+        target = createCase('New case');
+        setActive(target.id);
+        setTargetId(target.id);
+      }
+      const saved = addAttachment(target.id, attachment);
+      toast.push(saved ? `Trace saved to "${target.title}"` : 'Case not found', saved ? 'success' : 'error');
+    } catch (err) {
+      toast.push(err instanceof Error ? err.message : 'Could not save the trace', 'error');
+    }
+  };
+
+  return (
+    <span className="add-to-case">
+      {cases.length > 1 && (
+        <select className="input input--select input--sm" value={targetId ?? ''} onChange={(e) => setTargetId(e.target.value)} aria-label="Target case for the saved trace" disabled={!graph}>
+          {cases.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.title}
+            </option>
+          ))}
+        </select>
+      )}
+      <button type="button" className="btn btn--sm" data-testid="trace-save-case" onClick={save} disabled={!graph} title="Store this graph in a case; reopen or download it from the Cases page">
+        Save trace to case
+      </button>
+    </span>
   );
 }
 

@@ -7,19 +7,20 @@
 import { useMemo, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import type { ChainFamily, ChainInfo } from '@/lib/types';
-import { findChain } from '@/lib/chains/registry';
+import { findChain, historyNeedsKey } from '@/lib/chains/registry';
 import { isEvmAddress } from '@/lib/detect';
+import { useSettings } from '@/lib/settings/store';
 import { shorten } from '@/lib/format';
 import { isSanctioned } from '@/lib/intel/sanctions';
 import { canonicalAddress } from '@/hooks/dispatch';
 import { useAddressSummary } from '@/hooks/useAddressSummary';
-import { useApprovals } from '@/hooks/useApprovals';
+import { useApprovalScan } from '@/hooks/useApprovals';
 import { useLabel, useLabelsRevision } from '@/hooks/useLabel';
 import { usePageTitle } from '@/hooks/usePageTitle';
 import { useRisk } from '@/hooks/useRisk';
 import AddToCaseButton from '@/components/AddToCaseButton';
 import Card from '@/components/Card';
-import ChainBadge from '@/components/ChainBadge';
+import ChainBadge, { KeyIcon } from '@/components/ChainBadge';
 import CopyButton from '@/components/CopyButton';
 import ErrorBox from '@/components/ErrorBox';
 import LabelChip from '@/components/LabelChip';
@@ -35,18 +36,28 @@ import '@/styles/pages.css';
 
 export type AddressTabId = 'overview' | 'transactions' | 'transfers' | 'internal' | 'tokens' | 'approvals' | 'contract';
 
-/** Tabs available per chain family. The test ids are part of the e2e contract (docs/UI_TESTIDS.md). */
+/**
+ * Tabs available per chain family. The test ids are part of the e2e contract
+ * (docs/UI_TESTIDS.md). Solana gets a Token transfers tab fed by the
+ * enriched signature pages (SPL rows).
+ */
 export function tabsFor(family: ChainFamily): TabDef[] {
   const tabs: TabDef[] = [
     { id: 'overview', label: 'Overview' },
     { id: 'transactions', label: 'Transactions', testId: 'address-tab-transactions' },
   ];
   if (family === 'evm') tabs.push({ id: 'transfers', label: 'Token transfers' }, { id: 'internal', label: 'Internal' });
+  if (family === 'solana') tabs.push({ id: 'transfers', label: 'Token transfers', title: 'SPL transfers found in the loaded signatures' });
   if (family !== 'bitcoin') tabs.push({ id: 'tokens', label: 'Tokens', testId: 'address-tab-tokens' });
   if (family === 'evm') {
     tabs.push({ id: 'approvals', label: 'Approvals', testId: 'address-tab-approvals' }, { id: 'contract', label: 'Contract', testId: 'address-tab-contract' });
   }
   return tabs;
+}
+
+/** True when the chain's history is key-gated and no Etherscan key is configured (notice above the tabs). */
+export function needsEtherscanKey(info: ChainInfo, etherscanApiKey: string | undefined): boolean {
+  return historyNeedsKey(info) && !(etherscanApiKey ?? '').trim();
 }
 
 /** Validates the route params and canonicalises the address; `error` is set when the page cannot be shown. */
@@ -79,7 +90,9 @@ function AddressProfile({ info, address }: { info: ChainInfo; address: string })
   const summaryQ = useAddressSummary(chain, address);
   const risk = useRisk(chain, address);
   // Shares the react-query cache with the Approvals tab and the risk hook; only used for the tab counter.
-  const approvalsQ = useApprovals(chain, address);
+  const approvalsQ = useApprovalScan(chain, address);
+  const etherscanApiKey = useSettings((s) => s.etherscanApiKey);
+  const keyNotice = needsEtherscanKey(info, etherscanApiKey);
   const label = useLabel(address, chain);
   const rev = useLabelsRevision();
   const sanctioned = useMemo(() => isSanctioned(address), [address, rev]);
@@ -88,8 +101,10 @@ function AddressProfile({ info, address }: { info: ChainInfo; address: string })
 
   const tabs = useMemo(() => {
     const list = tabsFor(info.family);
-    const count = approvalsQ.data?.length;
-    return count ? list.map((t) => (t.id === 'approvals' ? { ...t, count } : t)) : list;
+    const scan = approvalsQ.data;
+    const count = scan ? (scan.scanIncomplete ? `${scan.approvals.length}+` : scan.approvals.length) : 0;
+    const title = scan?.scanIncomplete ? 'Approval scan incomplete: the count is a lower bound' : undefined;
+    return count ? list.map((t) => (t.id === 'approvals' ? { ...t, count, title } : t)) : list;
   }, [info.family, approvalsQ.data]);
   const requested = searchParams.get('tab') ?? 'overview';
   const active = (tabs.some((t) => t.id === requested) ? requested : 'overview') as AddressTabId;
@@ -104,6 +119,7 @@ function AddressProfile({ info, address }: { info: ChainInfo; address: string })
   const retry = () => void summaryQ.refetch();
   const flagCount = risk.report?.flags.length ?? 0;
   const typeChip = summary ? (info.family === 'solana' ? (summary.executable ? 'Program' : 'Account') : summary.isContract ? 'Contract' : info.family === 'evm' ? 'EOA' : undefined) : undefined;
+  const riskTitle = risk.notes.length ? `Show the risk indicators (${risk.notes.join('; ')})` : 'Show the risk indicators';
 
   return (
     <>
@@ -124,10 +140,11 @@ function AddressProfile({ info, address }: { info: ChainInfo; address: string })
           {label && <LabelChip label={label} />}
           {sanctioned && sanctioned !== label && <LabelChip label={sanctioned} />}
           {typeChip && <span className="chip chip--other">{typeChip}</span>}
-          <button type="button" className="risk-toggle" onClick={() => setShowFlags((v) => !v)} aria-expanded={showFlags} title="Show the risk indicators">
+          <button type="button" className="risk-toggle" onClick={() => setShowFlags((v) => !v)} aria-expanded={showFlags} title={riskTitle}>
             <RiskBadge report={risk.report} loading={risk.loading} />
             <span className="small">
               {flagCount} flag{flagCount === 1 ? '' : 's'}
+              {risk.notes.length > 0 && <span className="risk-toggle__note"> · approvals not scanned</span>}
             </span>
             <span className="risk-toggle__caret" aria-hidden="true">
               ▼
@@ -155,8 +172,17 @@ function AddressProfile({ info, address }: { info: ChainInfo; address: string })
             </button>
           }
         >
-          <RiskFlags report={risk.report} loading={risk.loading} />
+          <RiskFlags report={risk.report} loading={risk.loading} chain={chain} notes={risk.notes} />
         </Card>
+      )}
+
+      {keyNotice && (
+        <p className="notice notice--key" role="status" data-testid="address-key-notice">
+          <span className="notice__icon" aria-hidden="true">
+            <KeyIcon />
+          </span>
+          Transaction history on {info.name} needs an Etherscan API key (no keyless explorer API). <Link to="/settings">Add one in Settings</Link>; balances and approvals still load from the RPC.
+        </p>
       )}
 
       <Tabs tabs={tabs} active={active} onChange={setTab} ariaLabel="Address sections" />

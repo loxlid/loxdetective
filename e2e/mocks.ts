@@ -19,7 +19,10 @@
  * the end that none occurred (resource 404s and favicon noise are tolerated).
  *
  * Specs import `test` / `expect` from this module so every test gets the
- * mocks and the `consoleErrors` fixture automatically.
+ * mocks and the `consoleErrors` fixture automatically. A test that needs one
+ * JSON-RPC method to answer differently (an error, another value) installs an
+ * override with `overrideRpc(page, …)` before navigating; every other request
+ * keeps the base fixtures.
  */
 import { expect, test as base, type Page, type Request, type Route } from '@playwright/test';
 import { CHAINS } from '../src/lib/chains/registry';
@@ -52,6 +55,9 @@ const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
 
 /** Ethereum mainnet endpoints from the registry: the only ones that know the mocked tx. */
 const ETHEREUM_RPCS = new Set((CHAINS.find((c) => c.id === 'ethereum')?.rpcUrls ?? []).map(normalizeUrl));
+
+/** EVM mainnets probed by the address page's activity strip (testnets are off by default). */
+export const EVM_MAINNET_CHAINS = CHAINS.filter((c) => c.family === 'evm' && !c.testnet);
 
 function normalizeUrl(u: string): string {
   return u.replace(/\/+$/, '').toLowerCase();
@@ -164,13 +170,21 @@ const MOCK_PRICES = {
 
 type Fulfill = NonNullable<Parameters<Route['fulfill']>[0]>;
 
-interface RpcCall {
+export interface RpcCall {
   id?: number | string | null;
   method?: string;
   params?: unknown;
 }
 
-type RpcResult = { result: unknown } | { error: { code: number; message: string } };
+export type RpcResult = { result: unknown } | { error: { code: number; message: string } };
+
+/** Per-test JSON-RPC override: return a reply to take over a call, `undefined` to keep the base fixture. */
+export type RpcOverride = (call: RpcCall, isEthereum: boolean) => RpcResult | undefined;
+
+/** Override that answers every `method` call (single or batched) with a JSON-RPC error. */
+export function rpcErrorFor(method: string, message: string, code = -32005): RpcOverride {
+  return (call) => (call.method === method ? { error: { code, message } } : undefined);
+}
 
 function json(status: number, body: unknown): Fulfill {
   return { status, contentType: 'application/json', body: JSON.stringify(body) };
@@ -200,7 +214,9 @@ function ethCallResult(params: unknown[]): string {
   }
 }
 
-function answerRpc(call: RpcCall, isEthereum: boolean): RpcResult {
+function answerRpc(call: RpcCall, isEthereum: boolean, override?: RpcOverride): RpcResult {
+  const overridden = override?.(call, isEthereum);
+  if (overridden) return overridden;
   const params = Array.isArray(call.params) ? call.params : [];
   const wantsMockTx = isEthereum && String(params[0] ?? '').toLowerCase() === TX_HASH;
   switch (call.method) {
@@ -232,9 +248,9 @@ function answerRpc(call: RpcCall, isEthereum: boolean): RpcResult {
 }
 
 /** JSON-RPC reply for a single call or a batch, preserving ids. */
-function rpcResponse(payload: unknown, url: URL): Fulfill {
+function rpcResponse(payload: unknown, url: URL, override?: RpcOverride): Fulfill {
   const isEthereum = ETHEREUM_RPCS.has(normalizeUrl(`${url.origin}${url.pathname}`));
-  const reply = (c: RpcCall) => ({ jsonrpc: '2.0', id: c.id ?? null, ...answerRpc(c, isEthereum) });
+  const reply = (c: RpcCall) => ({ jsonrpc: '2.0', id: c.id ?? null, ...answerRpc(c, isEthereum, override) });
   if (Array.isArray(payload)) return json(200, payload.map((c) => reply(c as RpcCall)));
   return json(200, reply(payload as RpcCall));
 }
@@ -307,6 +323,30 @@ export async function installNetworkMocks(page: Page): Promise<void> {
     }
     try {
       await route.fulfill(mockResponse(request, url));
+    } catch {
+      /* the page navigated away or closed while the request was in flight */
+    }
+  });
+}
+
+/**
+ * Answer selected JSON-RPC calls differently for the rest of a test. Playwright
+ * consults the most recently registered route first, so this handler sees the
+ * request before the base mocks; it answers JSON-RPC POSTs itself (base
+ * fixtures for the calls the override leaves alone) and hands everything else
+ * back with `route.fallback()`. Call it before navigating.
+ */
+export async function overrideRpc(page: Page, override: RpcOverride): Promise<void> {
+  await page.route('**/*', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const payload = request.method() === 'POST' && !LOCAL_HOSTS.has(url.hostname) ? parseJson(request.postData()) : undefined;
+    if (!Array.isArray(payload) && (payload === null || typeof payload !== 'object')) {
+      await route.fallback();
+      return;
+    }
+    try {
+      await route.fulfill(rpcResponse(payload, url, override));
     } catch {
       /* the page navigated away or closed while the request was in flight */
     }

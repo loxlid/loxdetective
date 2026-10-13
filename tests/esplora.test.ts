@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearEndpointCooldowns, HttpError, isEndpointCooling } from '@/lib/http';
 import {
+  BTC_DETAILED_DEFAULT_PAGES,
   btcAddressSummary,
   btcAddressTxs,
   btcDirection,
+  btcHistoryDetailed,
   btcTransaction,
   btcTxToListItem,
+  btcTxToListItems,
   btcUtxos,
   ESPLORA_PAGE_SIZE,
   type EsploraTx,
@@ -75,6 +79,7 @@ const txid = (n: number) => n.toString(16).padStart(64, '0');
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  clearEndpointCooldowns();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -143,6 +148,164 @@ describe('btcTxToListItem', () => {
     expect(cb.status).toBe('pending');
     expect(cb.timestamp).toBeUndefined();
     expect(cb.blockNumber).toBeUndefined();
+  });
+});
+
+describe('btcTxToListItems', () => {
+  const FOURTH = 'bc1qc7slrfxkknqcq2jevvvkdgvrt8080852dfjewde450xdlk4ugp7szw5tk9';
+
+  it('expands a batch payout into one out row per external output, skipping change', () => {
+    const tx = mkTx(txid(10), [{ addr: ADDR, value: 100_000 }], [
+      { addr: OTHER, value: 40_000 },
+      { addr: THIRD, value: 30_000 },
+      { addr: FOURTH, value: 20_000 },
+      { addr: ADDR, value: 9_000 }, // change
+    ]);
+    const rows = btcTxToListItems(ADDR, tx);
+    expect(rows).toHaveLength(3);
+    expect(rows.map((r) => r.to)).toEqual([OTHER, THIRD, FOURTH]);
+    expect(rows.map((r) => r.value.raw)).toEqual([40_000n, 30_000n, 20_000n]);
+    for (const r of rows) {
+      expect(r).toMatchObject({ chain: 'bitcoin', hash: txid(10), from: ADDR, direction: 'out', status: 'success', enriched: true });
+      expect(r.value).toMatchObject({ decimals: 8, symbol: 'BTC' });
+      expect(r.timestamp).toBe(1_700_000_000);
+      expect(r.blockNumber).toBe(800_000);
+    }
+    // The singular mapper still collapses the same transaction into one row.
+    const single = btcTxToListItem(tx, ADDR);
+    expect(single.to).toBe(OTHER);
+    expect(single.value.raw).toBe(91_000n);
+  });
+
+  it('treats outputs back to any input address as change and skips OP_RETURN', () => {
+    // Two-input spend (ADDR + OTHER) paying THIRD, with change to both inputs and a marker output.
+    const tx = mkTx(txid(11), [{ addr: ADDR, value: 60_000 }, { addr: OTHER, value: 40_000 }], [
+      { addr: THIRD, value: 50_000 },
+      { addr: OTHER, value: 25_000 },
+      { addr: ADDR, value: 24_000 },
+      { value: 0, type: 'op_return' },
+    ]);
+    const rows = btcTxToListItems(ADDR, tx);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ from: ADDR, to: THIRD, direction: 'out' });
+    // ADDR funded 60% of the inputs, so it is attributed 60% of the external output.
+    expect(rows[0].value.raw).toBe(30_000n);
+    // Seen from OTHER, the same output is attributed the remaining 40%.
+    expect(btcTxToListItems(OTHER, tx)[0].value.raw).toBe(20_000n);
+  });
+
+  it('splits a receive from several input addresses proportionally by input value', () => {
+    const tx = mkTx(txid(12), [{ addr: OTHER, value: 75_000 }, { addr: THIRD, value: 25_000 }], [
+      { addr: ADDR, value: 90_000 },
+      { addr: OTHER, value: 9_000 },
+    ]);
+    const rows = btcTxToListItems(ADDR, tx);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ from: OTHER, to: ADDR, direction: 'in', enriched: true });
+    expect(rows[1]).toMatchObject({ from: THIRD, to: ADDR, direction: 'in' });
+    expect(rows[0].value.raw).toBe(67_500n);
+    expect(rows[1].value.raw).toBe(22_500n);
+    expect(rows[0].value.raw + rows[1].value.raw).toBe(90_000n);
+  });
+
+  it('keeps the parts summing exactly to the received amount when the split does not divide evenly', () => {
+    // A consolidation has no external counterparty and falls back to the singular 'self' row.
+    const self = btcTxToListItems(ADDR, mkTx(txid(13), [{ addr: ADDR, value: 50 }, { addr: ADDR, value: 50 }], [{ addr: ADDR, value: 99 }]));
+    expect(self).toHaveLength(1);
+    expect(self[0]).toMatchObject({ direction: 'self', from: ADDR, to: ADDR, value: { raw: 1n } });
+
+    const recv = mkTx(txid(14), [{ addr: OTHER, value: 2 }, { addr: THIRD, value: 1 }], [{ addr: ADDR, value: 100 }]);
+    const rows = btcTxToListItems(ADDR, recv);
+    expect(rows.map((r) => r.value.raw)).toEqual([67n, 33n]);
+    // Two inputs from the same address merge into one row.
+    const merged = btcTxToListItems(ADDR, mkTx(txid(15), [{ addr: OTHER, value: 5 }, { addr: OTHER, value: 5 }], [{ addr: ADDR, value: 9 }]));
+    expect(merged).toHaveLength(1);
+    expect(merged[0]).toMatchObject({ from: OTHER, value: { raw: 9n } });
+  });
+
+  it('maps coinbase, address-less inputs and unrelated transactions', () => {
+    const cb = btcTxToListItems(ADDR, mkTx(txid(16), [{ coinbase: true, value: 0 }], [{ addr: ADDR, value: 625_000_000 }, { addr: OTHER, value: 1 }], { confirmed: false }));
+    expect(cb).toHaveLength(1);
+    expect(cb[0]).toMatchObject({ from: 'coinbase', to: ADDR, direction: 'in', methodName: 'coinbase', status: 'pending' });
+    expect(cb[0].value.raw).toBe(625_000_000n);
+    expect(cb[0].timestamp).toBeUndefined();
+
+    const p2pk = btcTxToListItems(ADDR, mkTx(txid(17), [{ value: 10_000, type: 'p2pk' }], [{ addr: ADDR, value: 9_000 }]));
+    expect(p2pk).toHaveLength(1);
+    expect(p2pk[0]).toMatchObject({ from: 'unknown', direction: 'in', value: { raw: 9_000n } });
+
+    // Spend to an address-less output: destination 'unknown'.
+    const toP2pk = btcTxToListItems(ADDR, mkTx(txid(18), [{ addr: ADDR, value: 10_000 }], [{ value: 6_000, type: 'p2pk' }, { addr: ADDR, value: 3_900 }]));
+    expect(toP2pk).toHaveLength(1);
+    expect(toP2pk[0]).toMatchObject({ to: 'unknown', direction: 'out', value: { raw: 6_000n } });
+
+    expect(btcTxToListItems(ADDR, mkTx(txid(19), [{ addr: OTHER, value: 10 }], [{ addr: THIRD, value: 9 }]))).toEqual([]);
+  });
+});
+
+describe('btcHistoryDetailed', () => {
+  const page = (n: number, from: number, confirmed = true) =>
+    Array.from({ length: n }, (_, i) =>
+      mkTx(txid(from + i), [{ addr: ADDR, value: 10_000 }], [{ addr: OTHER, value: 4_000 }, { addr: THIRD, value: 3_000 }, { addr: ADDR, value: 2_900 }], confirmed ? { confirmed: true, block_height: 800_000 - i, block_time: 1_700_000_000 - i } : { confirmed: false }),
+    );
+
+  it('walks two pages by default and flattens every transaction into counterparty rows', async () => {
+    const first = page(ESPLORA_PAGE_SIZE, 100);
+    const second = page(3, 200);
+    const calls = mockFetch((url) => {
+      if (url === `${MEMPOOL}/address/${ADDR}/txs`) return { body: first };
+      if (url === `${MEMPOOL}/address/${ADDR}/txs/chain/${first[first.length - 1].txid}`) return { body: second };
+      return undefined;
+    });
+    const rows = await btcHistoryDetailed(ADDR);
+    expect(BTC_DETAILED_DEFAULT_PAGES).toBe(2);
+    expect(calls).toHaveLength(2);
+    expect(rows).toHaveLength((ESPLORA_PAGE_SIZE + 3) * 2);
+    expect(rows[0]).toMatchObject({ hash: txid(100), to: OTHER, direction: 'out', enriched: true });
+    expect(rows[1]).toMatchObject({ hash: txid(100), to: THIRD });
+    expect(rows[rows.length - 1]).toMatchObject({ hash: txid(202), to: THIRD });
+  });
+
+  it('honours the pages option and stops early on a short page', async () => {
+    const first = page(ESPLORA_PAGE_SIZE, 100);
+    const second = page(ESPLORA_PAGE_SIZE, 200);
+    const third = page(1, 300);
+    const calls = mockFetch((url) => {
+      if (url === `${MEMPOOL}/address/${ADDR}/txs`) return { body: first };
+      if (url === `${MEMPOOL}/address/${ADDR}/txs/chain/${first[first.length - 1].txid}`) return { body: second };
+      if (url === `${MEMPOOL}/address/${ADDR}/txs/chain/${second[second.length - 1].txid}`) return { body: third };
+      return undefined;
+    });
+    const rows = await btcHistoryDetailed(ADDR, { pages: 5 });
+    expect(calls).toHaveLength(3);
+    expect(rows).toHaveLength((ESPLORA_PAGE_SIZE * 2 + 1) * 2);
+    const one = await btcHistoryDetailed(ADDR, { pages: 1 });
+    expect(one).toHaveLength(ESPLORA_PAGE_SIZE * 2);
+    expect(calls).toHaveLength(4);
+  });
+
+  it('throws when the first page fails but keeps earlier pages when a later one fails', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const first = page(ESPLORA_PAGE_SIZE, 100);
+    mockFetch((url) => {
+      if (url === `${MEMPOOL}/address/${ADDR}/txs`) return { body: first };
+      return { status: 400, body: 'Bad request' };
+    });
+    const rows = await btcHistoryDetailed(ADDR);
+    expect(rows).toHaveLength(ESPLORA_PAGE_SIZE * 2);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    mockFetch(() => ({ status: 400, body: 'Invalid Bitcoin address' }));
+    await expect(btcHistoryDetailed('bc1qnotvalid')).rejects.toThrow(/Invalid Bitcoin address/);
+  });
+
+  it('lower-cases bech32 and rejects an aborted signal', async () => {
+    const calls = mockFetch(() => ({ body: [] }));
+    await expect(btcHistoryDetailed(ADDR.toUpperCase())).resolves.toEqual([]);
+    expect(calls[0]).toBe(`${MEMPOOL}/address/${ADDR}/txs`);
+    const ctl = new AbortController();
+    ctl.abort();
+    await expect(btcHistoryDetailed(ADDR, { signal: ctl.signal })).rejects.toThrow();
   });
 });
 
@@ -244,8 +407,31 @@ describe('btcAddressTxs', () => {
 
   it('does not retry a 4xx on the next endpoint and surfaces a readable message', async () => {
     const calls = mockFetch(() => ({ status: 400, body: 'Invalid Bitcoin address' }));
-    await expect(btcAddressTxs('bc1qnotvalid')).rejects.toThrow(/Esplora rejected .*Invalid Bitcoin address/);
+    const err = await btcAddressTxs('bc1qnotvalid').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(400);
+    expect((err as HttpError).message).toMatch(/Esplora rejected .*Invalid Bitcoin address/);
     expect(calls).toHaveLength(1);
+    // A deterministic 4xx marks no endpoint as unhealthy.
+    expect(isEndpointCooling(MEMPOOL)).toBe(false);
+    expect(isEndpointCooling(BLOCKSTREAM)).toBe(false);
+  });
+});
+
+describe('esplora 4xx handling', () => {
+  it('keeps a 404 as an HttpError with the readable message and cools no endpoint down', async () => {
+    clearEndpointCooldowns();
+    const calls = mockFetch(() => ({ status: 404, body: 'Transaction not found' }));
+    const err = await btcTransaction(txid(9)).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(404);
+    expect((err as HttpError).message).toBe(`Esplora: Transaction not found (/tx/${txid(9)})`);
+    await expect(btcTransaction(txid(9))).rejects.toThrow(/not found/);
+    expect(isEndpointCooling(MEMPOOL)).toBe(false);
+    expect(isEndpointCooling(BLOCKSTREAM)).toBe(false);
+    // The second endpoint is never contacted for a definitive answer.
+    expect(calls.every((u) => u.startsWith(MEMPOOL))).toBe(true);
+    expect(calls.filter((u) => u.endsWith(`/tx/${txid(9)}`))).toHaveLength(2);
   });
 });
 

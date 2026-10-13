@@ -109,12 +109,44 @@ function cleanUrls(list: unknown): string[] {
     .filter((u) => /^https?:\/\//i.test(u));
 }
 
-/** Ordered endpoint list for a chain: user overrides first, then the registry defaults. */
+/**
+ * Alchemy network slugs for the chains it serves; the RPC URL is
+ * `https://<slug>.g.alchemy.com/v2/<key>`.
+ */
+export const ALCHEMY_SLUGS: Readonly<Record<string, string>> = {
+  ethereum: 'eth-mainnet',
+  base: 'base-mainnet',
+  arbitrum: 'arb-mainnet',
+  optimism: 'opt-mainnet',
+  polygon: 'polygon-mainnet',
+  zksync: 'zksync-mainnet',
+  linea: 'linea-mainnet',
+  scroll: 'scroll-mainnet',
+  blast: 'blast-mainnet',
+  bsc: 'bnb-mainnet',
+  avalanche: 'avax-mainnet',
+  gnosis: 'gnosis-mainnet',
+  'polygon-zkevm': 'polygonzkevm-mainnet',
+  celo: 'celo-mainnet',
+  sepolia: 'eth-sepolia',
+};
+
+/** Alchemy JSON-RPC URL for `chain` when a key is configured and Alchemy serves that network. */
+export function alchemyUrlFor(chain: ChainInfo, apiKey: string | undefined = getSettings().alchemyApiKey): string | undefined {
+  const key = apiKey?.trim();
+  const slug = ALCHEMY_SLUGS[chain.id];
+  if (!key || !slug) return undefined;
+  return `https://${slug}.g.alchemy.com/v2/${encodeURIComponent(key)}`;
+}
+
+/** Ordered endpoint list for a chain: user overrides first, then Alchemy (when a key is set), then the registry defaults. */
 export function rpcUrlsFor(chain: ChainInfo): string[] {
-  const custom = cleanUrls(getSettings().customRpc?.[chain.id]);
+  const settings = getSettings();
+  const custom = cleanUrls(settings.customRpc?.[chain.id]);
+  const alchemy = alchemyUrlFor(chain, settings.alchemyApiKey);
   const seen = new Set<string>();
   const out: string[] = [];
-  for (const u of [...custom, ...chain.rpcUrls]) {
+  for (const u of [...custom, ...(alchemy ? [alchemy] : []), ...chain.rpcUrls]) {
     if (!seen.has(u)) {
       seen.add(u);
       out.push(u);

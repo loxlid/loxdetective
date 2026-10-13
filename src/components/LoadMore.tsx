@@ -1,3 +1,5 @@
+import type { ReactNode } from 'react';
+
 interface Props {
   hasMore: boolean;
   loading: boolean;
@@ -8,10 +10,12 @@ interface Props {
   source?: string;
   label?: string;
   className?: string;
+  /** Extra status text after the provenance (e.g. "enriching 10 of 25…"). */
+  hint?: ReactNode;
 }
 
-/** Cursor-based "Load more" footer with row count and provenance. */
-export default function LoadMore({ hasMore, loading, onLoadMore, count, source, label = 'Load more', className }: Props) {
+/** Cursor-based "Load more" footer with row count, provenance and an optional status hint. */
+export default function LoadMore({ hasMore, loading, onLoadMore, count, source, label = 'Load more', className, hint }: Props) {
   return (
     <div className={`load-more${className ? ` ${className}` : ''}`}>
       <span className="load-more__meta muted">
@@ -20,6 +24,12 @@ export default function LoadMore({ hasMore, loading, onLoadMore, count, source, 
         {source && (
           <>
             via <span className="mono">{source}</span>
+          </>
+        )}
+        {hint && (
+          <>
+            {(count !== undefined || source) && ' · '}
+            <span className="load-more__hint">{hint}</span>
           </>
         )}
       </span>

@@ -44,11 +44,11 @@ export default function AboutPage() {
           <li>Universal search across every supported EVM network, Bitcoin and Solana.</li>
           <li>Address profiles with multi-chain balances, history, token holdings, approvals and contract details.</li>
           <li>Transaction decoding (transfers, internal calls, events), a fund-flow tracer with an interactive graph, deterministic risk heuristics and built-in labels.</li>
-          <li>Local investigation cases with tags, notes and JSON export / import.</li>
+          <li>Local investigation cases with tags, notes, saved traces and JSON export / import.</li>
         </ul>
       </Card>
 
-      <Card title="Data sources & their limits" subtitle="Every request goes straight from your browser to one of these public endpoints. Custom RPCs from Settings are tried first.">
+      <Card title="Data sources & their limits" subtitle="Every request goes straight from your browser to one of these public endpoints. Custom RPCs from Settings are tried first, then Alchemy when a key is set, then the public list.">
         <div className="table-scroll">
           <table className="table table--compact">
             <thead>
@@ -98,11 +98,28 @@ export default function AboutPage() {
             <Link to="/settings">Settings</Link>.
           </li>
         </ul>
+        <h3 className="mt">Endpoint fallback & cooldown</h3>
+        <ul className="bullets">
+          <li>
+            Every chain has an ordered list of endpoints (your custom RPCs, then Alchemy when a key is set, then the public ones). A request that fails is retried on the next endpoint, except for errors the provider recognises as
+            deterministic — EVM JSON-RPC reverts and invalid-parameter errors, and 4xx answers from the Bitcoin (Esplora) API — which fail immediately. Only timeouts, network errors and HTTP 5xx / 429 answers mark the endpoint as
+            unhealthy.
+          </li>
+          <li>
+            An endpoint that failed that way is put on a one-minute <strong>cooldown</strong>: it is not dropped but moved to the back of the queue, so healthy endpoints answer first and a request only fails when every endpoint
+            is down. A successful answer clears the cooldown immediately.
+          </li>
+        </ul>
         <h3 className="mt">Known limits</h3>
         <ul className="bullets">
-          <li>Public RPCs are rate-limited and sometimes refuse large <code>eth_getLogs</code> ranges; the approvals scan then returns an empty list instead of an error.</li>
-          <li>History on chains without a Blockscout instance (BNB Chain, Cronos, Moonbeam…) needs an Etherscan API key.</li>
-          <li>Bitcoin history is limited to the Esplora page size (25 confirmed transactions per page); Solana rows carry no amounts until the transaction is opened.</li>
+          <li>
+            Public RPCs are rate-limited and sometimes refuse large <code>eth_getLogs</code> ranges. The approvals scan splits the range into chunks and keeps what it found before a refusal; the Approvals tab then shows a{' '}
+            <strong>scan status</strong> that says which block range was covered and why it stopped, instead of pretending the list is complete.
+          </li>
+          <li>History on chains without a Blockscout instance (BNB Chain, Cronos, Moonbeam…) needs an Etherscan API key; Avalanche and Fantom use the keyless Routescan API.</li>
+          <li>
+            Bitcoin history is limited to the Esplora page size (25 confirmed transactions per page). Solana rows start as signatures and are enriched with the actual SOL / SPL transfers for the newest entries only.
+          </li>
           <li>Labels and risk heuristics are hints, not verdicts. Verify with primary sources before acting on them.</li>
         </ul>
       </Card>

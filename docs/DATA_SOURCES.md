@@ -6,6 +6,17 @@ public APIs below. There is no proxy and no backend. All calls run through
 with a per-attempt timeout, so a slow or dead endpoint falls through to the next
 one in the list.
 
+**Endpoint cooldown.** `withFallback` remembers endpoints that failed in a way
+that suggests the endpoint, not the request, is at fault — a timeout, a network
+error, an HTTP 5xx or 429 — and puts them on a cooldown of `COOLDOWN_MS`
+(60 s). A cooling endpoint is not dropped: `orderByCooldown` moves it to the
+back of the queue, so healthy endpoints are tried first and a request can still
+succeed when every endpoint is cooling. A successful answer clears the mark.
+Deterministic errors (JSON-RPC errors such as reverts or invalid params, HTTP
+4xx other than 429, aborts) never mark an endpoint. The multi-chain probes
+(activity strip, transaction lookup) use a shorter `PROBE_TIMEOUT_MS` (6 s)
+than ordinary requests (12–15 s).
+
 Rate limits are those published or observed at the time of writing (October 2026);
 public providers change them without notice. "CORS" means the endpoint sends
 `Access-Control-Allow-Origin` headers that let a browser on `loxlid.github.io`
@@ -17,15 +28,19 @@ User-supplied endpoints and keys are configured in **Settings** and stored in
 ## 1. EVM JSON-RPC
 
 Used by [`src/lib/providers/evm/rpc.ts`](../src/lib/providers/evm/rpc.ts).
-Endpoints are tried in order (custom RPCs from Settings first); a request that
-fails on one endpoint is retried on the next. Deterministic errors (reverts,
-invalid params) are not retried.
+Endpoints are tried in order — custom RPCs from Settings, then Alchemy when a
+key is set (section 1a), then the registry defaults below, reordered so that
+endpoints on cooldown come last; a request that fails on one endpoint is
+retried on the next. Deterministic errors (reverts, invalid params) are not
+retried.
 
 Methods: `eth_blockNumber`, `eth_getBalance`, `eth_getCode`,
 `eth_getTransactionCount`, `eth_getTransactionByHash`,
 `eth_getTransactionReceipt`, `eth_getBlockByNumber`, `eth_getStorageAt`,
 `eth_call` (ERC-20 metadata, `balanceOf`, ENS registry/resolver, proxy probes)
 and `eth_getLogs` (approval scan over a bounded range, at most 2 endpoints).
+The multi-chain activity strip sends one JSON-RPC **batch**
+(`eth_getBalance` + `eth_getTransactionCount`) per chain, six chains at a time.
 
 | Chain | Endpoints (in order) | Key | CORS | Rate limit |
 | --- | --- | --- | --- | --- |
@@ -44,14 +59,50 @@ and `eth_getLogs` (approval scan over a bounded range, at most 2 endpoints).
 | Blast (81457) | `https://rpc.blast.io`, `https://blast-rpc.publicnode.com` | No | Yes | Fair use. |
 | Mantle (5000) | `https://rpc.mantle.xyz`, `https://mantle-rpc.publicnode.com` | No | Yes | Fair use. |
 | Celo (42220) | `https://forno.celo.org`, `https://celo-rpc.publicnode.com` | No | Yes | Forno: fair use. |
-| Fantom Opera (250) | `https://rpc.ftm.tools`, `https://fantom-rpc.publicnode.com`, `https://1rpc.io/ftm` | No | Yes | Fair use. |
+| Fantom Opera (legacy) (250) | `https://rpc.ftm.tools`, `https://fantom-rpc.publicnode.com`, `https://1rpc.io/ftm` | No | Yes | Fair use. The network is being superseded by Sonic; public endpoints may thin out. |
 | Cronos (25) | `https://evm.cronos.org`, `https://cronos-evm-rpc.publicnode.com` | No | Yes | Fair use. |
 | Moonbeam (1284) | `https://rpc.api.moonbeam.network`, `https://moonbeam-rpc.publicnode.com` | No | Yes | Moonbeam public RPC: 1,000 req/s burst per IP, `eth_getLogs` range capped. |
 | Sepolia (11155111, testnet) | `https://ethereum-sepolia-rpc.publicnode.com`, `https://rpc.sepolia.org`, `https://1rpc.io/sepolia` | No | Yes | Fair use. |
 
 Public RPCs regularly reject large `eth_getLogs` ranges; the approvals scanner
-splits the range and gives up after 10 requests, returning an empty list
-instead of an error.
+(`scanApprovals`) splits the range into chunks and stops at the first refusal,
+keeping the approvals found in the chunks that succeeded. The result carries
+`scanIncomplete`, the scanned `fromBlock` / `toBlock` and a human-readable
+`reason` (for example "The Base RPC refused the approval log query (query
+exceeds max block range); blocks 1,000,000–3,000,000 were not scanned"), which
+the Approvals tab shows as the scan status.
+
+### 1a. Alchemy (optional, EVM JSON-RPC)
+
+Configured in **Settings → Alchemy API key**
+([`src/lib/settings/store.ts`](../src/lib/settings/store.ts), `alchemyUrlFor`).
+When a key is present, `rpcUrlsFor(chain)` inserts
+`https://<slug>.g.alchemy.com/v2/<key>` after the custom RPCs and before the
+public defaults for the chains Alchemy serves. The key is URL-encoded and only
+ever sent to `*.g.alchemy.com`.
+
+| Chain | Alchemy network slug |
+| --- | --- |
+| Ethereum | `eth-mainnet` |
+| Base | `base-mainnet` |
+| Arbitrum One | `arb-mainnet` |
+| OP Mainnet | `opt-mainnet` |
+| Polygon PoS | `polygon-mainnet` |
+| zkSync Era | `zksync-mainnet` |
+| Linea | `linea-mainnet` |
+| Scroll | `scroll-mainnet` |
+| Blast | `blast-mainnet` |
+| BNB Smart Chain | `bnb-mainnet` |
+| Avalanche C-Chain | `avax-mainnet` |
+| Gnosis Chain | `gnosis-mainnet` |
+| Polygon zkEVM | `polygonzkevm-mainnet` |
+| Celo | `celo-mainnet` |
+| Sepolia | `eth-sepolia` |
+
+Mantle, Fantom, Cronos and Moonbeam are not served and keep the public
+endpoints. Key: **yes** (free tier available). CORS: yes. Rate limit: per plan
+(compute units per second); a 429 puts the endpoint on cooldown like any other.
+Only standard JSON-RPC methods are used today; Alchemy's enhanced APIs are not.
 
 ## 2. Blockscout API v2
 
@@ -99,12 +150,15 @@ instance in the registry and fall back to section 3.
 Used by [`src/lib/providers/evm/etherscan.ts`](../src/lib/providers/evm/etherscan.ts)
 when Blockscout is unavailable or fails. Actions: `module=account` with
 `action=txlist`, `tokentx`, `txlistinternal`, `balance`, paged with
-`page`/`offset`, sorted descending.
+`page`/`offset`, sorted descending. Which backend serves a chain's history is
+answered by `historySource(chain)` in the registry (`blockscout`,
+`etherscan-key`, `routescan`, `esplora`, `solana-rpc`); `historyNeedsKey(chain)`
+is true only for chains that have neither Blockscout nor Routescan.
 
 | Provider | Endpoint | Chains | Key | CORS | Rate limit |
 | --- | --- | --- | --- | --- | --- |
 | Etherscan V2 (multi-chain) | `https://api.etherscan.io/v2/api?chainid=<id>&…&apikey=<key>` | Every EVM chain except Avalanche and Fantom | **Yes** — free key from etherscan.io, entered in Settings | Yes | Free tier: 5 calls/s, 100,000 calls/day |
-| Routescan | `https://api.routescan.io/v2/network/mainnet/evm/<id>/etherscan/api` | Avalanche (43114), Fantom (250) | No | Yes | Modest per-IP throttle (HTTP 429 when exceeded) |
+| Routescan | `https://api.routescan.io/v2/network/mainnet/evm/<id>/etherscan/api` | Avalanche (43114), Fantom (250) | No | Yes | Modest per-IP throttle (HTTP 429 when exceeded, which puts the endpoint on cooldown). Etherscan-compatible responses, so the same parser is used; `source` is reported as `routescan` |
 
 Without a key, history on chains that have neither Blockscout nor Routescan
 (BNB Smart Chain, Cronos, Moonbeam) raises
@@ -118,7 +172,7 @@ mempool.space and Blockstream expose the same Esplora API and are tried in order
 | Path | Purpose |
 | --- | --- |
 | `GET /address/{address}` | `chain_stats` + `mempool_stats` (funded/spent sums, tx counts) |
-| `GET /address/{address}/txs` | Newest transactions (mempool + 25 confirmed) |
+| `GET /address/{address}/txs` | Newest transactions (mempool + 25 confirmed); the tracer walks up to 2 pages (`btcHistoryDetailed`) and emits one row per counterparty (`btcTxToListItems`) |
 | `GET /address/{address}/txs/chain/{lastSeenTxid}` | Next page of confirmed transactions |
 | `GET /address/{address}/utxo` | Unspent outputs |
 | `GET /tx/{txid}` | Transaction with inputs/outputs/status |
@@ -136,7 +190,11 @@ Used by [`src/lib/providers/sol/rpc.ts`](../src/lib/providers/sol/rpc.ts).
 Methods: `getAccountInfo` (jsonParsed), `getBalance`,
 `getTokenAccountsByOwner` (Token and Token-2022 programs, jsonParsed),
 `getSignaturesForAddress`, `getTransaction` (jsonParsed,
-`maxSupportedTransactionVersion: 0`).
+`maxSupportedTransactionVersion: 0`). History enrichment
+(`solEnrichHistory`) fetches `getTransaction` for up to 25 of the newest
+successful signatures per page (15 in the tracer), three at a time, through an
+in-memory per-signature cache of 500 entries, and replaces each signature row
+by one row per SOL / SPL transfer touching the address.
 
 | Provider | Endpoint | Key | CORS | Rate limit |
 | --- | --- | --- | --- | --- |

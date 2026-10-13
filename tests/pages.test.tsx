@@ -15,15 +15,21 @@ vi.hoisted(() => {
   (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 });
 
-import type { NativeBalance, Transaction, TxListItem } from '@/lib/types';
-import { getChain } from '@/lib/chains/registry';
+import type { ChainActivity, NativeBalance, Transaction, TxListItem } from '@/lib/types';
+import { evmChains, getChain } from '@/lib/chains/registry';
+import { clearEndpointCooldowns } from '@/lib/http';
+import { clearSolTxCache } from '@/lib/providers/sol/rpc';
 import { useSettings } from '@/lib/settings/store';
 import { useCases } from '@/lib/cases/store';
-import AddressPage, { tabsFor, validateAddressRoute } from '@/pages/AddressPage';
+import AddressPage, { needsEtherscanKey, tabsFor, validateAddressRoute } from '@/pages/AddressPage';
 import TxPage, { buildTxStats, extraLabel, extraValue } from '@/pages/TxPage';
 import TracePage, { clampInt, describeTransfers, DEFAULT_TRACE_FORM } from '@/pages/TracePage';
-import { orderBalances, seenRange } from '@/components/address/OverviewTab';
+import { activityHeadline, orderBalances, seenRange, txCountLabel } from '@/components/address/OverviewTab';
 import { counterpartyOf } from '@/components/address/HistoryTable';
+import { isActiveChain, orderActivity, otherActiveChains, summaryLooksInactive } from '@/hooks/useMultiChainActivity';
+import { summarizeUtxos } from '@/hooks/useBtcUtxos';
+import { enrichHint, splitEnrichedRows } from '@/hooks/useSolEnrichedHistory';
+import { scannedSpan } from '@/hooks/useApprovals';
 import { transferPriceKey } from '@/components/tx/TransfersTable';
 
 // ---------------------------------------------------------------------------
@@ -43,6 +49,15 @@ const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a
 const BTC_ADDR = 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97';
 const BTC_OTHER = 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh';
 const BTC_TXID = 'b'.repeat(64);
+const BTC_UTXO_TXID = 'e'.repeat(64);
+
+const SOL_PAYER = '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU';
+const SOL_RECIPIENT = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
+const SOL_USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const SOL_SYSTEM = '11111111111111111111111111111111';
+const SOL_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const SOL_SIG_1 = '5'.repeat(87);
+const SOL_SIG_2 = '4'.repeat(87);
 
 function word(n: bigint | number): string {
   return BigInt(n).toString(16).padStart(64, '0');
@@ -125,6 +140,43 @@ const PRICES = {
   },
 };
 
+const BTC_UTXOS = [
+  { txid: BTC_UTXO_TXID, vout: 1, status: { confirmed: true, block_height: 850_000 }, value: 100_000 },
+  { txid: BTC_TXID, vout: 0, status: { confirmed: false }, value: 50_000 },
+];
+
+const solTokenBalance = (accountIndex: number, owner: string, amount: string) => ({
+  accountIndex,
+  mint: SOL_USDC,
+  owner,
+  programId: SOL_TOKEN_PROGRAM,
+  uiTokenAmount: { amount, decimals: 6, uiAmount: Number(amount) / 1e6, uiAmountString: String(Number(amount) / 1e6) },
+});
+
+/** Payer → recipient: 1 SOL native + 2 USDC SPL, signed `sig`. */
+function solRawTx(sig: string) {
+  return {
+    slot: 250_000_000,
+    blockTime: 1_700_000_000,
+    meta: {
+      err: null,
+      fee: 5_000,
+      preBalances: [10_000_000_000, 0, 1, 2_039_280, 2_039_280],
+      postBalances: [8_999_995_000, 1_000_000_000, 1, 2_039_280, 2_039_280],
+      preTokenBalances: [solTokenBalance(3, SOL_PAYER, '5000000')],
+      postTokenBalances: [solTokenBalance(3, SOL_PAYER, '3000000'), solTokenBalance(4, SOL_RECIPIENT, '2000000')],
+      logMessages: [],
+    },
+    transaction: {
+      message: {
+        accountKeys: [{ pubkey: SOL_PAYER, signer: true }, { pubkey: SOL_RECIPIENT }, { pubkey: SOL_SYSTEM }, { pubkey: 'ta3payer111111111111111111111111111111111111' }, { pubkey: 'ta4recipient11111111111111111111111111111111' }],
+        instructions: [{ programId: SOL_SYSTEM, program: 'system', parsed: { type: 'transfer', info: {} } }],
+      },
+      signatures: [sig],
+    },
+  };
+}
+
 const COLLECTIONS = new Set(['transactions', 'token-transfers', 'tokens', 'internal-transactions', 'logs']);
 
 type RpcReq = { id: number; method: string; params?: unknown[] };
@@ -158,11 +210,11 @@ function answerRpc(r: RpcReq, url: string): unknown {
     case 'eth_blockNumber':
       return ok('0x1234567');
     case 'eth_getBalance':
-      return ok(ONE_ETH_WEI);
+      return ok(zeroOnEthereum && isEthereum ? '0x0' : ONE_ETH_WEI);
     case 'eth_getCode':
       return ok('0x');
     case 'eth_getTransactionCount':
-      return ok('0x5');
+      return ok(zeroOnEthereum && isEthereum ? '0x0' : '0x5');
     case 'eth_getTransactionByHash':
       return ok(wantsTx ? MOCK_TX : null);
     case 'eth_getTransactionReceipt':
@@ -174,7 +226,23 @@ function answerRpc(r: RpcReq, url: string): unknown {
     case 'eth_getStorageAt':
       return ok(ZERO_WORD);
     case 'eth_getLogs':
-      return ok([]);
+      return logsRefused ? { jsonrpc: '2.0', id: r.id, error: { code: -32005, message: 'query exceeds max block range' } } : ok([]);
+    // Solana
+    case 'getAccountInfo':
+      return ok({ context: { slot: 1 }, value: { lamports: 8_999_995_000, owner: SOL_SYSTEM, executable: false, data: ['', 'base64'] } });
+    case 'getBalance':
+      return ok({ context: { slot: 1 }, value: 8_999_995_000 });
+    case 'getTokenAccountsByOwner':
+      return ok({ context: { slot: 1 }, value: [] });
+    case 'getSignaturesForAddress':
+      return ok([
+        { signature: SOL_SIG_1, slot: 250_000_000, blockTime: 1_700_000_000, err: null },
+        { signature: SOL_SIG_2, slot: 249_000_000, blockTime: 1_699_000_000, err: null },
+      ]);
+    case 'getTransaction': {
+      const raw = solRawTx(String(params[0]));
+      return ok(solTxNoSpl ? { ...raw, meta: { ...raw.meta, preTokenBalances: [], postTokenBalances: [] } } : raw);
+    }
     default:
       return { jsonrpc: '2.0', id: r.id, error: { code: -32601, message: `Method not found: ${r.method}` } };
   }
@@ -182,6 +250,16 @@ function answerRpc(r: RpcReq, url: string): unknown {
 
 /** When set, Blockscout's internal-transactions endpoint keeps returning a next page (truncation path). */
 let internalCallsEndless = false;
+/** When set, Ethereum mainnet RPCs answer zero balance and zero nonce (the address is only active elsewhere). */
+let zeroOnEthereum = false;
+/** When set, every eth_getLogs call is refused with a range error (incomplete approval scan). */
+let logsRefused = false;
+/** Blockscout `/addresses/{a}/transactions` items (empty by default). */
+let blockscoutTxItems: unknown[] = [];
+/** When set, Solana `getTransaction` requests never answer (enrichment stays pending). */
+let solTxHangs = false;
+/** When set, Solana transactions move no SPL token (only the native transfer). */
+let solTxNoSpl = false;
 
 /** Mock fetch: JSON-RPC, Blockscout, Esplora, DefiLlama; 404 elsewhere. */
 function installFetch(): ReturnType<typeof vi.fn> {
@@ -189,6 +267,7 @@ function installFetch(): ReturnType<typeof vi.fn> {
     const url = String(input);
     if (init?.method === 'POST' && init.body) {
       const req = JSON.parse(String(init.body)) as RpcReq | RpcReq[];
+      if (solTxHangs && !Array.isArray(req) && req.method === 'getTransaction') return new Promise<Response>(() => undefined);
       return jsonResponse(Array.isArray(req) ? req.map((c) => answerRpc(c, url)) : answerRpc(req, url));
     }
     const path = new URL(url).pathname;
@@ -196,6 +275,9 @@ function installFetch(): ReturnType<typeof vi.fn> {
       const segments = path.split('/api/v2/')[1]?.split('/').filter(Boolean) ?? [];
       if (segments[0] === 'addresses' && segments.length === 2) {
         return jsonResponse({ hash: segments[1], is_contract: false, is_verified: false, name: null, ens_domain_name: null, token: null });
+      }
+      if (segments[0] === 'addresses' && segments[2] === 'transactions' && blockscoutTxItems.length) {
+        return jsonResponse({ items: blockscoutTxItems, next_page_params: null });
       }
       if (internalCallsEndless && segments[segments.length - 1] === 'internal-transactions') {
         return jsonResponse({ items: [{ transaction_hash: TX_HASH, from: { hash: USDC }, to: { hash: ADDRESS }, value: '0', type: 'call', success: true }], next_page_params: { index: 1 } });
@@ -207,6 +289,7 @@ function installFetch(): ReturnType<typeof vi.fn> {
       if (path.endsWith('/blocks/tip/height')) return new Response('860000', { status: 200 });
       if (path.endsWith(`/address/${BTC_ADDR}`)) return jsonResponse(BTC_STATS);
       if (path.endsWith(`/address/${BTC_ADDR}/txs`)) return jsonResponse([BTC_TX]);
+      if (path.endsWith(`/address/${BTC_ADDR}/utxo`)) return jsonResponse(BTC_UTXOS);
       if (path.endsWith(`/tx/${BTC_TXID}`)) return jsonResponse(BTC_TX);
       return jsonResponse({ error: 'not found' }, 404);
     }
@@ -296,6 +379,13 @@ async function click(el: HTMLElement | null): Promise<void> {
 
 beforeEach(() => {
   installFetch();
+  clearEndpointCooldowns();
+  clearSolTxCache();
+  zeroOnEthereum = false;
+  logsRefused = false;
+  blockscoutTxItems = [];
+  solTxHangs = false;
+  solTxNoSpl = false;
   localStorage.clear();
   useSettings.getState().reset();
   useCases.setState({ cases: [], activeCaseId: undefined });
@@ -331,9 +421,19 @@ describe('AddressPage', () => {
     await waitFor(() => /none|low|medium|high|critical/i.test(textOf(c, 'risk-badge')));
     expect(textOf(c, 'risk-badge')).toMatch(/none/i);
 
-    // Multi-chain strip links each chain to its own profile.
-    await waitFor(() => c.querySelectorAll('.balance-tile').length > 0);
-    expect(c.querySelector(`a.balance-tile[href="/address/base/${ADDRESS}"]`)).not.toBeNull();
+    // Multi-chain activity strip (card id used by the e2e suite) links each chain to its own profile and counts txs.
+    const strip = byTestId(c, 'address-activity-strip') as HTMLElement;
+    expect(strip).not.toBeNull();
+    await waitFor(() => strip.querySelectorAll('.balance-tile').length > 0);
+    const baseTile = strip.querySelector(`a.balance-tile[href="/address/base/${ADDRESS}"]`);
+    expect(baseTile).not.toBeNull();
+    expect(baseTile?.textContent).toContain('5 txs');
+    expect(baseTile?.textContent).toContain('1 ETH');
+    expect(strip.textContent).toMatch(/Active on \d+ of \d+ chains/);
+    expect(strip.querySelectorAll('.activity-tile').length).toBe(evmChains(false).length);
+    expect(byTestId(c, 'address-active-elsewhere')).toBeNull();
+    // Counterparties card is present but empty without history rows.
+    expect(c.textContent).toContain('Top counterparties');
 
     // Tabs: the selection is reflected in the URL query and the panel changes.
     await click(byTestId(c, 'address-tab-tokens'));
@@ -385,6 +485,166 @@ describe('AddressPage', () => {
     expect(row.textContent).toContain('+0.001');
     expect(row.querySelector(`a[href="/address/bitcoin/${BTC_OTHER}"]`)).not.toBeNull();
     expect(row.querySelector(`a[href="/tx/bitcoin/${BTC_TXID}"]`)).not.toBeNull();
+    m.unmount();
+  });
+
+  it('points at other chains when the address is idle on Ethereum but active elsewhere', async () => {
+    zeroOnEthereum = true;
+    const m = await mount(<AddressPage />, `/address/ethereum/${ADDRESS}`, '/address/:chain/:address');
+    const c = m.container;
+    await waitFor(() => byTestId(c, 'address-active-elsewhere') !== null);
+    const callout = byTestId(c, 'address-active-elsewhere') as HTMLElement;
+    expect(callout.textContent).toContain('No activity on Ethereum — this address is active on');
+    expect(callout.textContent).toContain('Base (5 txs)');
+    expect(callout.querySelector(`a[href="/address/base/${ADDRESS}"]`)).not.toBeNull();
+    expect(callout.textContent).not.toContain('Ethereum (');
+    // The strip ranks the idle current chain after the active ones and still shows its 0 txs.
+    await waitFor(() => c.querySelectorAll('.balance-tile').length > 0);
+    const tiles = Array.from(c.querySelectorAll<HTMLAnchorElement>('a.balance-tile'));
+    expect(tiles[0].getAttribute('href')).not.toBe(`/address/ethereum/${ADDRESS}`);
+    const eth = tiles.find((t) => t.getAttribute('href') === `/address/ethereum/${ADDRESS}`);
+    expect(eth?.textContent).toContain('0 txs');
+    expect(eth?.className).toContain('is-zero');
+    m.unmount();
+  });
+
+  it('aggregates counterparties from the loaded history rows', async () => {
+    blockscoutTxItems = [
+      { hash: TX_HASH, from: { hash: RECIPIENT }, to: { hash: ADDRESS }, value: '2000000000000000000', timestamp: '2024-09-22T00:00:00.000000Z', block_number: 10, status: 'ok', method: 'transfer' },
+      { hash: `0x${'cc'.repeat(32)}`, from: { hash: ADDRESS }, to: { hash: RECIPIENT }, value: '1000000000000000000', timestamp: '2024-09-21T00:00:00.000000Z', block_number: 9, status: 'ok', method: null },
+      { hash: `0x${'dd'.repeat(32)}`, from: { hash: ADDRESS }, to: { hash: ADDRESS }, value: '1', timestamp: '2024-09-20T00:00:00.000000Z', block_number: 8, status: 'ok', method: null },
+    ];
+    const m = await mount(<AddressPage />, `/address/ethereum/${ADDRESS}`, '/address/:chain/:address');
+    const c = m.container;
+    await waitFor(() => c.querySelector(`a[href="/trace/ethereum/${RECIPIENT}"]`) !== null);
+    const card = c.querySelector(`a[href="/trace/ethereum/${RECIPIENT}"]`)?.closest('.card') as HTMLElement;
+    expect(card.textContent).toContain('Top counterparties');
+    expect(card.textContent).toContain('From loaded pages only (3 rows)');
+    const row = card.querySelector('table tbody tr') as HTMLElement;
+    expect(row.textContent).toContain('2'); // row count
+    expect(row.textContent).toContain('+2');
+    expect(row.textContent).toContain('−1');
+    expect(row.querySelector(`a[href="/address/ethereum/${RECIPIENT}"]`)).not.toBeNull();
+    // The self transfer is skipped: only one counterparty row.
+    expect(card.querySelectorAll('table tbody tr')).toHaveLength(1);
+    m.unmount();
+  });
+
+  it('warns when the approval scan is incomplete and tells the risk assessment', async () => {
+    logsRefused = true;
+    const m = await mount(<AddressPage />, `/address/ethereum/${ADDRESS}?tab=approvals`, '/address/:chain/:address');
+    const c = m.container;
+    await waitFor(() => byTestId(c, 'approvals-incomplete') !== null);
+    const banner = byTestId(c, 'approvals-incomplete') as HTMLElement;
+    expect(banner.textContent).toContain('Approval scan incomplete');
+    expect(banner.textContent).toContain('query exceeds max block range');
+    expect(banner.querySelector('a[href="/settings"]')?.textContent).toContain('custom RPC in Settings');
+    // Not an empty state: the warning is the headline, the table just says the scanned part was empty.
+    expect(c.textContent).not.toContain('No active approvals found');
+    expect(c.textContent).toContain('No approvals in the scanned part');
+    expect(c.textContent).toMatch(/Scanned blocks [\d,]+–[\d,]+/);
+    // Risk: approvals are passed as unknown and the caveat is visible.
+    await waitFor(() => /approvals not scanned/.test(c.querySelector('.risk-toggle')?.getAttribute('title') ?? ''));
+    expect(c.querySelector('.risk-toggle')?.textContent).toContain('approvals not scanned');
+    await click(c.querySelector<HTMLElement>('.risk-toggle'));
+    expect(c.querySelector('.flag-notes')?.textContent).toContain('approvals not scanned');
+    expect(c.querySelector('.flag-notes')?.textContent).toContain('query exceeds max block range');
+    m.unmount();
+  });
+
+  it('shows an API-key notice for key-gated chains until a key is configured', async () => {
+    const m = await mount(<AddressPage />, `/address/bsc/${ADDRESS}`, '/address/:chain/:address');
+    const notice = byTestId(m.container, 'address-key-notice');
+    expect(notice).not.toBeNull();
+    expect(notice?.textContent).toContain('needs an Etherscan API key');
+    expect(notice?.querySelector('a[href="/settings"]')).not.toBeNull();
+    m.unmount();
+
+    useSettings.getState().set({ etherscanApiKey: 'KEY' });
+    const withKey = await mount(<AddressPage />, `/address/bsc/${ADDRESS}`, '/address/:chain/:address');
+    expect(byTestId(withKey.container, 'address-key-notice')).toBeNull();
+    withKey.unmount();
+
+    const eth = await mount(<AddressPage />, `/address/ethereum/${ADDRESS}`, '/address/:chain/:address');
+    expect(byTestId(eth.container, 'address-key-notice')).toBeNull();
+    eth.unmount();
+  });
+
+  it('renders the Bitcoin UTXO card with count, total and the largest outputs', async () => {
+    const m = await mount(<AddressPage />, `/address/bitcoin/${BTC_ADDR}`, '/address/:chain/:address');
+    const c = m.container;
+    await waitFor(() => (byTestId(c, 'address-utxos')?.querySelectorAll('table tbody tr').length ?? 0) === 2);
+    const card = byTestId(c, 'address-utxos') as HTMLElement;
+    expect(card.textContent).toContain('UTXOs');
+    expect(card.textContent).toContain('1 confirmed');
+    expect(card.textContent).toContain('0.0015 BTC');
+    expect(card.textContent).toContain('$90.00');
+    const rows = card.querySelectorAll('table tbody tr');
+    // Largest first.
+    expect(rows[0].textContent).toContain('#1');
+    expect(rows[0].textContent).toContain('0.001 BTC');
+    expect(rows[0].textContent).toContain('Confirmed');
+    expect(rows[0].querySelector(`a[href="/tx/bitcoin/${BTC_UTXO_TXID}"]`)).not.toBeNull();
+    expect(rows[1].textContent).toContain('In mempool');
+    expect(card.textContent).toContain('All 2 unspent outputs shown');
+    m.unmount();
+  });
+
+  it('enriches Solana signatures into direction / counterparty / value rows and an SPL transfers tab', async () => {
+    const m = await mount(<AddressPage />, `/address/solana/${SOL_PAYER}?tab=transactions`, '/address/:chain/:address');
+    const c = m.container;
+    // Solana now has a Token transfers tab.
+    expect(Array.from(c.querySelectorAll('[role="tab"]')).map((t) => t.textContent)).toContain('Token transfers');
+    await waitFor(() => c.querySelectorAll('table tbody tr').length === 2 && (c.textContent?.includes('−1') ?? false));
+    const row = c.querySelector('table tbody tr') as HTMLElement;
+    expect(row.textContent).toContain('Out');
+    expect(row.textContent).toContain('−1');
+    expect(row.textContent).toContain('SOL');
+    expect(row.querySelector(`a[href="/address/solana/${SOL_RECIPIENT}"]`)).not.toBeNull();
+    expect(row.querySelector(`a[href="/tx/solana/${SOL_SIG_1}"]`)).not.toBeNull();
+    expect(c.textContent).toContain('2 rows');
+    expect(c.textContent).toContain('End of results');
+    expect(c.textContent).not.toContain('enriching');
+
+    // SPL rows land in the Token transfers tab.
+    const transfers = Array.from(c.querySelectorAll<HTMLElement>('[role="tab"]')).find((t) => t.textContent === 'Token transfers');
+    await click(transfers ?? null);
+    await waitFor(() => c.querySelectorAll('table tbody tr').length === 2 && (c.textContent?.includes('USDC') ?? false));
+    const spl = c.querySelector('table tbody tr') as HTMLElement;
+    expect(spl.textContent).toContain('USDC');
+    expect(spl.textContent).toContain('−2');
+    expect(spl.querySelector(`a[href="/address/solana/${SOL_RECIPIENT}"]`)).not.toBeNull();
+
+    // Top counterparties come from the enriched rows (4 rows: 2 native + 2 SPL, one counterparty).
+    await click(Array.from(c.querySelectorAll<HTMLElement>('[role="tab"]')).find((t) => t.textContent === 'Overview') ?? null);
+    await waitFor(() => c.querySelector(`a[href="/trace/solana/${SOL_RECIPIENT}"]`) !== null);
+    const cp = c.querySelector(`a[href="/trace/solana/${SOL_RECIPIENT}"]`)?.closest('tr') as HTMLElement;
+    expect(cp.textContent).toContain('4');
+    expect(cp.textContent).toContain('(2 token)');
+    expect(cp.textContent).toContain('−2 SOL');
+    expect(c.textContent).toContain('From loaded pages only (4 rows)');
+    m.unmount();
+  });
+
+  it('keeps the Solana Token transfers tab loading while enrichment is still running', async () => {
+    solTxHangs = true;
+    const m = await mount(<AddressPage />, `/address/solana/${SOL_PAYER}?tab=transfers`, '/address/:chain/:address');
+    const c = m.container;
+    // The signature list is loaded (footer reports the pending enrichment) but no page has been enriched yet.
+    await waitFor(() => c.textContent?.includes('enriching 0 of 2…') ?? false);
+    expect(c.textContent).toContain('Loading…');
+    expect(c.textContent).not.toContain('No SPL transfers');
+    m.unmount();
+    // The detached getTransaction request is still pending; drop it so later tests do not share it.
+    clearSolTxCache();
+  });
+
+  it('shows the Solana "No SPL transfers" empty state only once enrichment found no SPL rows', async () => {
+    solTxNoSpl = true;
+    const m = await mount(<AddressPage />, `/address/solana/${SOL_PAYER}?tab=transfers`, '/address/:chain/:address');
+    const c = m.container;
+    await waitFor(() => (c.textContent?.includes('No SPL transfers') ?? false) && !c.textContent?.includes('enriching'));
+    expect(c.textContent).not.toContain('Loading…');
     m.unmount();
   });
 
@@ -547,7 +807,7 @@ describe('helpers', () => {
   it('tabsFor is family aware and carries the e2e test ids', () => {
     expect(tabsFor('evm').map((t) => t.id)).toEqual(['overview', 'transactions', 'transfers', 'internal', 'tokens', 'approvals', 'contract']);
     expect(tabsFor('bitcoin').map((t) => t.id)).toEqual(['overview', 'transactions']);
-    expect(tabsFor('solana').map((t) => t.id)).toEqual(['overview', 'transactions', 'tokens']);
+    expect(tabsFor('solana').map((t) => t.id)).toEqual(['overview', 'transactions', 'transfers', 'tokens']);
     expect(tabsFor('evm').map((t) => t.testId).filter(Boolean)).toEqual(['address-tab-transactions', 'address-tab-tokens', 'address-tab-approvals', 'address-tab-contract']);
   });
 
@@ -629,6 +889,69 @@ describe('helpers', () => {
     expect(sol).toContain('Compute units');
     expect(sol).toContain('Program');
     expect(sol).not.toContain('Nonce');
+  });
+
+  it('orderActivity ranks active chains by USD then tx count, idle next, failures last', () => {
+    const a = (chain: string, balance: bigint, txCount?: number, usd?: number, error?: string): ChainActivity => ({
+      chain,
+      balance: error && balance === 0n && txCount === undefined ? undefined : { chain, balance, decimals: 18, symbol: 'ETH', usd },
+      txCount,
+      error,
+    });
+    const list = [a('idle', 0n, 0), a('txonly', 0n, 7), a('rich', 10n ** 18n, 1, 2500), a('dead', 0n, undefined, undefined, 'boom'), a('small', 10n ** 17n, 50, 250), a('partial', 10n ** 18n, undefined, 2500, 'count failed')];
+    expect(orderActivity(list).map((x) => x.chain)).toEqual(['rich', 'partial', 'small', 'txonly', 'idle', 'dead']);
+    expect(isActiveChain(a('idle', 0n, 0))).toBe(false);
+    expect(isActiveChain(a('txonly', 0n, 7))).toBe(true);
+    expect(isActiveChain(a('dead', 0n, undefined, undefined, 'boom'))).toBe(false);
+    expect(otherActiveChains(list, 'rich').map((x) => x.chain)).toEqual(['partial', 'small', 'txonly']);
+    expect(activityHeadline(list)).toBe('Active on 4 of 6 chains · ≈ $5,250.00 in native balances');
+    expect(activityHeadline([a('idle', 0n, 0)])).toBe('Active on 0 of 1 chain.');
+    expect(txCountLabel(a('txonly', 0n, 1))).toBe('1 tx');
+    expect(txCountLabel(a('dead', 0n, undefined, undefined, 'boom'))).toBe('n/a');
+  });
+
+  it('summaryLooksInactive needs a zero nonce and a zero balance on an EOA', () => {
+    const base = { chain: 'ethereum', address: ADDRESS, isContract: false, txCount: 0, nativeBalance: { chain: 'ethereum', balance: 0n, decimals: 18, symbol: 'ETH' } };
+    expect(summaryLooksInactive(base)).toBe(true);
+    expect(summaryLooksInactive({ ...base, txCount: 1 })).toBe(false);
+    expect(summaryLooksInactive({ ...base, nativeBalance: { ...base.nativeBalance, balance: 1n } })).toBe(false);
+    expect(summaryLooksInactive({ ...base, nativeBalance: { ...base.nativeBalance, error: 'rpc' } })).toBe(false);
+    expect(summaryLooksInactive({ ...base, isContract: true })).toBe(false);
+    expect(summaryLooksInactive(undefined)).toBe(false);
+  });
+
+  it('summarizeUtxos totals and keeps the largest outputs', () => {
+    const u = (vout: number, value: bigint, confirmed = true) => ({ txid: 'a'.repeat(64), vout, value, confirmed });
+    const s = summarizeUtxos([u(0, 5n), u(1, 50n, false), u(2, 20n), u(3, 50n)], 2);
+    expect(s.count).toBe(4);
+    expect(s.confirmed).toBe(3);
+    expect(s.total).toBe(125n);
+    expect(s.top.map((x) => x.vout)).toEqual([3, 1]);
+    expect(summarizeUtxos([])).toEqual({ count: 0, confirmed: 0, total: 0n, top: [] });
+  });
+
+  it('splitEnrichedRows, enrichHint and scannedSpan', () => {
+    const native: TxListItem = { chain: 'solana', hash: SOL_SIG_1, from: SOL_PAYER, to: SOL_RECIPIENT, value: { raw: 1n, decimals: 9, symbol: 'SOL' }, status: 'success', direction: 'out', enriched: true };
+    const spl: TxListItem = { ...native, token: { symbol: 'USDC', amount: { raw: 1n, decimals: 6, symbol: 'USDC' }, tokenAddress: SOL_USDC, kind: 'SPL' } };
+    expect(splitEnrichedRows([native, spl], 'tx')).toEqual([native]);
+    expect(splitEnrichedRows([native, spl], 'token')).toEqual([spl]);
+    expect(splitEnrichedRows([native, spl], 'internal')).toEqual([]);
+    expect(enrichHint({ done: 0, total: 25, loading: true })).toBe('enriching 0 of 25…');
+    expect(enrichHint({ done: 25, total: 50, loading: true })).toBe('enriching 25 of 50…');
+    expect(enrichHint({ done: 50, total: 50, loading: false })).toBeUndefined();
+    expect(enrichHint({ done: 0, total: 0, loading: true })).toBeUndefined();
+    expect(scannedSpan({ fromBlock: 1_000_000, toBlock: 3_000_000 })).toBe('Scanned blocks 1,000,000–3,000,000');
+    expect(scannedSpan({ fromBlock: undefined, toBlock: 3 })).toBeUndefined();
+    expect(scannedSpan(undefined)).toBeUndefined();
+  });
+
+  it('needsEtherscanKey is true only for key-gated chains without a key', () => {
+    expect(needsEtherscanKey(getChain('bsc'), undefined)).toBe(true);
+    expect(needsEtherscanKey(getChain('bsc'), '  ')).toBe(true);
+    expect(needsEtherscanKey(getChain('bsc'), 'KEY')).toBe(false);
+    expect(needsEtherscanKey(getChain('ethereum'), undefined)).toBe(false);
+    expect(needsEtherscanKey(getChain('avalanche'), undefined)).toBe(false);
+    expect(needsEtherscanKey(getChain('bitcoin'), undefined)).toBe(false);
   });
 
   it('clampInt, describeTransfers and the trace form defaults', () => {

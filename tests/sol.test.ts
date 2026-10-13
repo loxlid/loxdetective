@@ -1,19 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { clearEndpointCooldowns } from '@/lib/http';
 import {
+  clearSolTxCache,
   deriveNativeTransfers,
   deriveSplTransfers,
   KNOWN_SOL_MINTS,
   KNOWN_SOL_PROGRAMS,
   matchFlows,
+  SOL_ENRICH_DEFAULT_CONCURRENCY,
+  SOL_ENRICH_DEFAULT_LIMIT,
+  SOL_TX_CACHE_MAX,
   solAddressSummary,
+  solEnrichHistory,
   solSignatures,
   solTokenBalances,
   solTransaction,
+  solTransfersToRows,
+  solTxCacheSize,
   SYSTEM_PROGRAM_ID,
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from '@/lib/providers/sol/rpc';
 import { useSettings } from '@/lib/settings/store';
+import type { Transaction, TxListItem } from '@/lib/types';
 
 const PAYER = '5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9';
 const RECIPIENT = 'H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS';
@@ -64,6 +73,8 @@ const tokenBalance = (accountIndex: number, mint: string, owner: string, amount:
 beforeEach(() => {
   vi.restoreAllMocks();
   useSettings.getState().reset();
+  clearEndpointCooldowns();
+  clearSolTxCache();
 });
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -431,6 +442,254 @@ describe('solTransaction', () => {
       throw new Error('Invalid param: WrongSize');
     });
     await expect(solTransaction(SIG)).rejects.toThrow(/Solana RPC getTransaction failed/);
+  });
+});
+
+describe('solTransfersToRows', () => {
+  const sol = (raw: bigint) => ({ raw, decimals: 9, symbol: 'SOL' });
+  const usdc = (raw: bigint) => ({ raw, decimals: 6, symbol: 'USDC' });
+  const tx: Transaction = {
+    chain: 'solana',
+    hash: SIG,
+    status: 'success',
+    blockNumber: 250_000_000,
+    timestamp: 1_700_000_000,
+    from: PAYER,
+    to: SYSTEM_PROGRAM_ID,
+    value: sol(1_000_000_000n),
+    methodName: 'System Program: transfer',
+    transfers: [
+      { kind: 'native', from: PAYER, to: RECIPIENT, amount: sol(1_000_000_000n), index: 0 },
+      { kind: 'native', from: VAULT, to: PAYER, amount: sol(5n), index: 1 },
+      { kind: 'native', from: VAULT, to: RECIPIENT, amount: sol(7n), index: 2 },
+      { kind: 'SPL', from: PAYER, to: RECIPIENT, amount: usdc(2_000_000n), token: { chain: 'solana', address: USDC, name: 'USD Coin', symbol: 'USDC', decimals: 6, type: 'SPL' }, index: 3 },
+      { kind: 'SPL', from: RECIPIENT, to: RECIPIENT, amount: usdc(1n), token: { chain: 'solana', address: USDC, name: 'USD Coin', symbol: 'USDC', decimals: 6, type: 'SPL' }, index: 4 },
+    ],
+  };
+
+  it('emits one row per transfer touching the address with direction, counterparty and token info', () => {
+    const rows = solTransfersToRows(PAYER, tx);
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatchObject({ chain: 'solana', hash: SIG, from: PAYER, to: RECIPIENT, direction: 'out', status: 'success', timestamp: 1_700_000_000, blockNumber: 250_000_000, methodName: 'System Program: transfer', enriched: true });
+    expect(rows[0].value).toEqual(sol(1_000_000_000n));
+    expect(rows[0].token).toBeUndefined();
+    expect(rows[1]).toMatchObject({ from: VAULT, to: PAYER, direction: 'in', value: sol(5n) });
+    expect(rows[2]).toMatchObject({ from: PAYER, to: RECIPIENT, direction: 'out' });
+    expect(rows[2].token).toEqual({ symbol: 'USDC', amount: usdc(2_000_000n), tokenAddress: USDC, kind: 'SPL' });
+    expect(rows[2].value).toEqual(usdc(2_000_000n));
+  });
+
+  it('marks self transfers and ignores transfers between third parties', () => {
+    const rows = solTransfersToRows(RECIPIENT, tx);
+    expect(rows.map((r) => r.direction)).toEqual(['in', 'in', 'in', 'self']);
+    expect(solTransfersToRows(VAULT, tx)).toHaveLength(2);
+    expect(solTransfersToRows('UNKNOWN', tx)).toEqual([]);
+    expect(solTransfersToRows(PAYER, { ...tx, transfers: [] })).toEqual([]);
+  });
+
+  it('propagates a failed status', () => {
+    const rows = solTransfersToRows(PAYER, { ...tx, status: 'failed' });
+    expect(rows.every((r) => r.status === 'failed')).toBe(true);
+  });
+});
+
+describe('solEnrichHistory', () => {
+  const SIG2 = '3'.repeat(88);
+  const SIG3 = '2'.repeat(88);
+  const SIG_BAD = 'notasignature';
+
+  function sigRow(hash: string, status: TxListItem['status'] = 'success'): TxListItem {
+    return { chain: 'solana', hash, from: PAYER, value: { raw: 0n, decimals: 9, symbol: 'SOL' }, status, direction: 'unknown', blockNumber: 1, timestamp: 1_600_000_000 };
+  }
+
+  /** A payer→recipient tx: 1 SOL native + 2 USDC SPL, signed `sig`. */
+  function rawTxFor(sig: string, overrides: Record<string, unknown> = {}) {
+    return {
+      slot: 250_000_000,
+      blockTime: 1_700_000_000,
+      meta: {
+        err: null,
+        fee: 5_000,
+        preBalances: [10_000_000_000, 0, 1, 2_039_280, 2_039_280],
+        postBalances: [8_999_995_000, 1_000_000_000, 1, 2_039_280, 2_039_280],
+        preTokenBalances: [tokenBalance(3, USDC, PAYER, '5000000')],
+        postTokenBalances: [tokenBalance(3, USDC, PAYER, '3000000'), tokenBalance(4, USDC, RECIPIENT, '2000000')],
+        logMessages: [],
+      },
+      transaction: {
+        message: {
+          accountKeys: [{ pubkey: PAYER, signer: true }, { pubkey: RECIPIENT }, { pubkey: SYSTEM_PROGRAM_ID }, { pubkey: 'ta3payer111111111111111111111111111111111111' }, { pubkey: 'ta4recipient11111111111111111111111111111111' }],
+          instructions: [{ programId: SYSTEM_PROGRAM_ID, program: 'system', parsed: { type: 'transfer', info: {} } }],
+        },
+        signatures: [sig],
+      },
+      ...overrides,
+    };
+  }
+
+  it('replaces signature rows with native and SPL rows and leaves failed / extra rows untouched', async () => {
+    const calls = mockRpc((method, params) => {
+      if (method !== 'getTransaction') throw new Error('unexpected');
+      return rawTxFor(String(params[0]));
+    });
+    const items = [sigRow(SIG), sigRow(SIG2, 'failed'), sigRow(SIG_BAD), sigRow(SIG3)];
+    const rows = await solEnrichHistory(PAYER, items, { limit: 1 });
+    expect(calls.map((c) => c.method)).toEqual(['getTransaction']);
+    expect(calls[0].params[0]).toBe(SIG);
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toMatchObject({ hash: SIG, from: PAYER, to: RECIPIENT, direction: 'out', status: 'success', timestamp: 1_700_000_000, blockNumber: 250_000_000, enriched: true });
+    expect(rows[0].value.raw).toBe(1_000_000_000n);
+    expect(rows[0].value.symbol).toBe('SOL');
+    expect(rows[1]).toMatchObject({ hash: SIG, direction: 'out', value: { raw: 2_000_000n, symbol: 'USDC', decimals: 6 } });
+    expect(rows[1].token).toMatchObject({ symbol: 'USDC', kind: 'SPL', tokenAddress: USDC });
+    // Failed, malformed and over-limit rows are the original objects.
+    expect(rows[2]).toBe(items[1]);
+    expect(rows[3]).toBe(items[2]);
+    expect(rows[4]).toBe(items[3]);
+    expect(rows[4].enriched).toBeUndefined();
+  });
+
+  it('sees the transfer from the recipient side as an incoming row', async () => {
+    mockRpc((_method, params) => rawTxFor(String(params[0])));
+    const rows = await solEnrichHistory(RECIPIENT, [sigRow(SIG)]);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toMatchObject({ from: PAYER, to: RECIPIENT, direction: 'in' });
+    expect(rows[1].token?.kind).toBe('SPL');
+    expect(rows[1].direction).toBe('in');
+  });
+
+  it('keeps the original row when the fetch fails and when the tx moved nothing for the address', async () => {
+    mockRpc((_method, params) => {
+      if (params[0] === SIG2) throw new Error('HTTP500');
+      if (params[0] === SIG3) return null;
+      return rawTxFor(String(params[0]), { meta: { err: null, fee: 5_000, preBalances: [10, 1], postBalances: [5, 1], preTokenBalances: [], postTokenBalances: [] } });
+    });
+    const items = [sigRow(SIG), sigRow(SIG2), sigRow(SIG3)];
+    const rows = await solEnrichHistory(PAYER, items);
+    expect(rows).toHaveLength(3);
+    // Fee-only tx: the original row survives, enriched with the tx details.
+    expect(rows[0]).toMatchObject({ hash: SIG, direction: 'unknown', enriched: true, timestamp: 1_700_000_000, blockNumber: 250_000_000 });
+    expect(rows[0].value.raw).toBe(0n);
+    expect(rows[0].methodName).toMatch(/System Program/);
+    // Transport failure (both endpoints) and "not found" keep the untouched rows.
+    expect(rows[1]).toBe(items[1]);
+    expect(rows[2]).toBe(items[2]);
+    expect(solTxCacheSize()).toBe(1);
+  });
+
+  it('serves repeated signatures from the cache and does not refetch', async () => {
+    const calls = mockRpc((_method, params) => rawTxFor(String(params[0])));
+    const first = await solEnrichHistory(PAYER, [sigRow(SIG), sigRow(SIG2)]);
+    expect(calls.filter((c) => c.method === 'getTransaction')).toHaveLength(2);
+    expect(first).toHaveLength(4);
+    const again = await solEnrichHistory(RECIPIENT, [sigRow(SIG), sigRow(SIG2)]);
+    expect(calls.filter((c) => c.method === 'getTransaction')).toHaveLength(2);
+    expect(again).toHaveLength(4);
+    expect(again[0].direction).toBe('in');
+    expect(solTxCacheSize()).toBe(2);
+    // Concurrent enrichments of the same signature share one request.
+    clearSolTxCache();
+    await Promise.all([solEnrichHistory(PAYER, [sigRow(SIG)]), solEnrichHistory(RECIPIENT, [sigRow(SIG)])]);
+    expect(calls.filter((c) => c.method === 'getTransaction')).toHaveLength(3);
+  });
+
+  it('evicts the least recently used entries beyond the cap', async () => {
+    mockRpc((_method, params) => rawTxFor(String(params[0])));
+    // Synthetic base58 signatures: digits 1-9 only ('0' is not base58), left-padded with 'A'.
+    const sigs = Array.from({ length: SOL_TX_CACHE_MAX + 5 }, (_, i) => (i + 1).toString().replace(/0/g, 'z').padStart(88, 'A'));
+    await solEnrichHistory(PAYER, sigs.map((s) => sigRow(s)), { limit: sigs.length, concurrency: 10 });
+    expect(solTxCacheSize()).toBe(SOL_TX_CACHE_MAX);
+  });
+
+  it('limits concurrency and respects the limit option', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_input: string | URL, init?: RequestInit) => {
+        const req = JSON.parse(String(init?.body)) as { id: number; params: unknown[] };
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return new Response(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: rawTxFor(String(req.params[0])) }), { status: 200 });
+      }),
+    );
+    const sigs = Array.from({ length: 8 }, (_, i) => (i + 1).toString().padStart(88, 'B'));
+    const rows = await solEnrichHistory(PAYER, sigs.map((s) => sigRow(s)), { limit: 6, concurrency: 2 });
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(rows.filter((r) => r.enriched)).toHaveLength(12);
+    expect(rows.filter((r) => !r.enriched)).toHaveLength(2);
+    expect(SOL_ENRICH_DEFAULT_LIMIT).toBe(25);
+    expect(SOL_ENRICH_DEFAULT_CONCURRENCY).toBe(3);
+  });
+
+  it('rejects when aborted and returns the input for an empty list', async () => {
+    mockRpc((_method, params) => rawTxFor(String(params[0])));
+    const ctl = new AbortController();
+    ctl.abort();
+    await expect(solEnrichHistory(PAYER, [sigRow(SIG)], { signal: ctl.signal })).rejects.toThrow();
+    await expect(solEnrichHistory(PAYER, [])).resolves.toEqual([]);
+  });
+
+  /** A getTransaction fetch stub that honours `init.signal` and resolves only when `release()` is called. */
+  function installDeferredRpc(): { calls: number; release(): void } {
+    const state = { calls: 0, release: () => undefined as void };
+    const gate = new Promise<void>((resolve) => {
+      state.release = resolve;
+    });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_input: string | URL, init?: RequestInit) =>
+          new Promise<Response>((resolve, reject) => {
+            const req = JSON.parse(String(init?.body)) as { id: number; method: string; params: unknown[] };
+            if (req.method === 'getTransaction') state.calls++;
+            const signal = init?.signal;
+            if (signal?.aborted) return reject(signal.reason);
+            signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+            void gate.then(() => resolve(new Response(JSON.stringify({ jsonrpc: '2.0', id: req.id, result: rawTxFor(String(req.params[0])) }), { status: 200 })));
+          }),
+      ),
+    );
+    return state;
+  }
+
+  it('does not leak one caller\'s abort into another enrichment sharing the in-flight request', async () => {
+    const rpc = installDeferredRpc();
+    const a = new AbortController();
+    const pa = solEnrichHistory(PAYER, [sigRow(SIG)], { signal: a.signal });
+    const pb = solEnrichHistory(RECIPIENT, [sigRow(SIG)]);
+    pa.catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 5));
+    a.abort();
+    await expect(pa).rejects.toMatchObject({ name: 'AbortError' });
+    rpc.release();
+    const rows = await pb;
+    // B still gets the enriched rows (native + SPL) from the one shared request.
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.enriched && r.direction === 'in')).toBe(true);
+    expect(rpc.calls).toBe(1);
+  });
+
+  it('rejects an aborted caller with its own AbortError while the shared fetch continues and warms the cache', async () => {
+    const rpc = installDeferredRpc();
+    const ctl = new AbortController();
+    const p = solEnrichHistory(PAYER, [sigRow(SIG)], { signal: ctl.signal });
+    p.catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 5));
+    expect(solTxCacheSize()).toBe(0);
+    ctl.abort();
+    await expect(p).rejects.toMatchObject({ name: 'AbortError' });
+    expect(solTxCacheSize()).toBe(0);
+    rpc.release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(solTxCacheSize()).toBe(1);
+    expect(rpc.calls).toBe(1);
+    // A later caller is served from the cache without a new request.
+    const rows = await solEnrichHistory(PAYER, [sigRow(SIG)]);
+    expect(rows).toHaveLength(2);
+    expect(rpc.calls).toBe(1);
   });
 });
 

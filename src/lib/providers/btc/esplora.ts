@@ -164,10 +164,11 @@ function isClientError(err: unknown): err is HttpError {
   return err instanceof HttpError && err.status !== undefined && err.status >= 400 && err.status < 500 && err.status !== 429;
 }
 
-function readableError(err: HttpError, path: string): Error {
+/** Readable `HttpError` that keeps the original status / url / body, so `isEndpointFailure` still sees a 4xx and no endpoint is cooled down. */
+function readableError(err: HttpError, path: string): HttpError {
   const body = typeof err.body === 'string' ? err.body.trim() : '';
-  if (err.status === 404) return new Error(`Esplora: ${body || 'not found'} (${path})`);
-  return new Error(`Esplora rejected ${path}: ${body || `HTTP ${err.status}`}`);
+  const message = err.status === 404 ? `Esplora: ${body || 'not found'} (${path})` : `Esplora rejected ${path}: ${body || `HTTP ${err.status}`}`;
+  return new HttpError(message, err.status, err.url, err.body);
 }
 
 /**
@@ -177,7 +178,7 @@ function readableError(err: HttpError, path: string): Error {
  */
 async function esploraGet<T>(path: string, signal?: AbortSignal): Promise<T> {
   const urls = rpcUrlsFor(getChain(CHAIN_ID));
-  let fatal: Error | undefined;
+  let fatal: HttpError | undefined;
   return withFallback(
     urls,
     async (base) => {
@@ -258,6 +259,114 @@ export function btcTxToListItem(tx: EsploraTx, address: string): TxListItem {
   };
 }
 
+/**
+ * Proportional split of `total` across `shares` (integer, exact: the rounding
+ * remainder goes to the largest share so the parts always sum to `total`).
+ */
+function splitProportionally(total: bigint, shares: readonly bigint[]): bigint[] {
+  const sum = shares.reduce((a, b) => a + b, 0n);
+  if (shares.length === 0) return [];
+  if (sum <= 0n) {
+    // No weights (e.g. prevouts without values): give everything to the first entry.
+    return shares.map((_, i) => (i === 0 ? total : 0n));
+  }
+  const parts = shares.map((w) => (total * w) / sum);
+  const remainder = total - parts.reduce((a, b) => a + b, 0n);
+  if (remainder !== 0n) {
+    let best = 0;
+    for (let i = 1; i < shares.length; i++) if (shares[i] > shares[best]) best = i;
+    parts[best] += remainder;
+  }
+  return parts;
+}
+
+/**
+ * Map a raw Esplora transaction to one history row **per external
+ * counterparty** of `address` (the singular `btcTxToListItem` collapses a
+ * transaction into one row with the largest counterparty).
+ *
+ * - `address` among the inputs (a spend): one `'out'` row per output that
+ *   does not go back to any input address (change heuristic: an output paid
+ *   to an address that also funded the transaction is change and skipped;
+ *   OP_RETURN outputs are skipped too). When several input addresses fund
+ *   the spend, each output is attributed to `address` proportionally to its
+ *   share of the input value.
+ * - `address` only among the outputs (a receive): one `'in'` row per distinct
+ *   input address, each carrying the share of the value received by `address`
+ *   proportional to that input's value; a coinbase transaction yields a single
+ *   row from `'coinbase'`.
+ * - A consolidation (no external counterparty) or a transaction that does not
+ *   touch the address falls back to the singular row so the transaction stays
+ *   visible.
+ *
+ * **Approximation**: Bitcoin has no sender→receiver mapping inside a
+ * transaction. Splitting proportionally by input value assumes every input
+ * funds every output pro rata, which is exact for single-input-address
+ * transactions and a best-effort attribution for CoinJoin / batched spends.
+ */
+export function btcTxToListItems(address: string, tx: EsploraTx): TxListItem[] {
+  const addr = address.trim();
+  const inputs = (tx.vin ?? []).map(vinToIo);
+  const outputs = (tx.vout ?? []).map(voutToIo);
+  const coinbase = isCoinbaseTx(tx);
+  const confirmed = tx.status?.confirmed === true;
+
+  const base = (direction: TxListItem['direction'], from: string, to: string, value: bigint): TxListItem => ({
+    chain: CHAIN_ID,
+    hash: tx.txid,
+    timestamp: confirmed ? tx.status?.block_time : undefined,
+    blockNumber: confirmed ? tx.status?.block_height : undefined,
+    from,
+    to,
+    value: btc(value),
+    status: confirmed ? 'success' : 'pending',
+    methodName: coinbase ? 'coinbase' : undefined,
+    direction,
+    enriched: true,
+  });
+
+  const inputAddresses = new Set(inputs.map((i) => i.address).filter((a): a is string => !!a && a !== 'coinbase'));
+  const spends = !coinbase && inputAddresses.has(addr);
+  const receives = outputs.some((o) => o.address === addr);
+
+  if (spends) {
+    const external = outputs.filter((o) => !(o.address && inputAddresses.has(o.address)) && o.scriptType !== 'op_return');
+    if (external.length === 0) return [btcTxToListItem(tx, addr)];
+    const totalIn = sumValues(inputs);
+    const ownIn = sumValues(inputs.filter((i) => i.address === addr));
+    const shareOf = (value: bigint): bigint => (totalIn > 0n && ownIn < totalIn ? (value * ownIn) / totalIn : value);
+    const rows: TxListItem[] = [];
+    for (const o of external) {
+      const value = shareOf(o.value);
+      if (value <= 0n && o.value > 0n) continue; // rounded away; nothing attributable
+      rows.push(base('out', addr, outputTarget(o), value));
+    }
+    return rows.length > 0 ? rows : [btcTxToListItem(tx, addr)];
+  }
+
+  if (receives) {
+    const received = sumValues(outputs.filter((o) => o.address === addr));
+    if (coinbase) return [base('in', 'coinbase', addr, received)];
+    // Distinct input addresses in first-seen order; address-less prevouts are grouped as 'unknown'.
+    const byAddress = new Map<string, bigint>();
+    for (const i of inputs) {
+      const key = i.address ?? 'unknown';
+      byAddress.set(key, (byAddress.get(key) ?? 0n) + i.value);
+    }
+    if (byAddress.size === 0) return [base('in', 'unknown', addr, received)];
+    const senders = Array.from(byAddress.entries());
+    const parts = splitProportionally(received, senders.map(([, v]) => v));
+    const rows: TxListItem[] = [];
+    senders.forEach(([from], n) => {
+      if (parts[n] <= 0n && received > 0n) return;
+      rows.push(base('in', from, addr, parts[n]));
+    });
+    return rows.length > 0 ? rows : [btcTxToListItem(tx, addr)];
+  }
+
+  return [];
+}
+
 /* ---------- Public API ---------- */
 
 /**
@@ -321,14 +430,57 @@ export async function btcAddressTxs(
   signal?: AbortSignal,
 ): Promise<PagedResult<TxListItem>> {
   const addr = normalizeAddress(address);
+  const { txs, nextCursor } = await addressTxPage(addr, lastSeenTxid, signal);
+  const items = txs.map((tx) => btcTxToListItem(tx, addr));
+  return { items, nextCursor, source: SOURCE };
+}
+
+/** One raw page of `/address/{a}/txs[/chain/{txid}]` plus the cursor for the next one. */
+async function addressTxPage(
+  addr: string,
+  lastSeenTxid: string | undefined,
+  signal: AbortSignal | undefined,
+): Promise<{ txs: EsploraTx[]; nextCursor?: string }> {
   const path = lastSeenTxid ? `/address/${addr}/txs/chain/${lastSeenTxid}` : `/address/${addr}/txs`;
   const txs = await esploraGet<EsploraTx[]>(path, signal);
   if (!Array.isArray(txs)) throw new Error('Unexpected Esplora response for address transactions');
-
-  const items = txs.map((tx) => btcTxToListItem(tx, addr));
   const confirmed = txs.filter((t) => t.status?.confirmed === true);
   const nextCursor = confirmed.length >= ESPLORA_PAGE_SIZE ? confirmed[confirmed.length - 1].txid : undefined;
-  return { items, nextCursor, source: SOURCE };
+  return { txs, nextCursor };
+}
+
+/** Default number of Esplora pages walked by `btcHistoryDetailed`. */
+export const BTC_DETAILED_DEFAULT_PAGES = 2;
+
+/**
+ * Walk up to `opts.pages` (default 2) pages of `/address/{a}/txs` and flatten
+ * every transaction with `btcTxToListItems`, so a batch payout to N addresses
+ * becomes N rows. The first page must succeed; a later page that fails (other
+ * than by abort) ends the walk with what was collected so far.
+ */
+export async function btcHistoryDetailed(
+  address: string,
+  opts: { pages?: number; signal?: AbortSignal } = {},
+): Promise<TxListItem[]> {
+  const addr = normalizeAddress(address);
+  const pages = Math.max(1, Math.floor(opts.pages ?? BTC_DETAILED_DEFAULT_PAGES));
+  const { signal } = opts;
+  const out: TxListItem[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < pages; page++) {
+    let res: { txs: EsploraTx[]; nextCursor?: string };
+    try {
+      res = await addressTxPage(addr, cursor, signal);
+    } catch (err) {
+      if (page === 0 || signal?.aborted) throw err;
+      console.warn(`[esplora] history page ${page + 1} unavailable for ${addr}:`, err instanceof Error ? err.message : String(err));
+      break;
+    }
+    for (const tx of res.txs) out.push(...btcTxToListItems(addr, tx));
+    if (!res.nextCursor) break;
+    cursor = res.nextCursor;
+  }
+  return out;
 }
 
 /**

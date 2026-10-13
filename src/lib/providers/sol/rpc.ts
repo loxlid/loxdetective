@@ -10,7 +10,7 @@
  */
 import { getChain } from '@/lib/chains/registry';
 import { shorten } from '@/lib/format';
-import { jsonRpc, RpcError, withFallback } from '@/lib/http';
+import { jsonRpc, mapLimit, RpcError, withFallback } from '@/lib/http';
 import { getSettings, rpcUrlsFor } from '@/lib/settings/store';
 import type { AddressSummary, Amount, PagedResult, TokenBalance, TokenInfo, Transaction, Transfer, TxListItem } from '@/lib/types';
 
@@ -513,4 +513,201 @@ export async function solTransaction(signature: string, signal?: AbortSignal): P
       logTruncated: (meta.logMessages?.length ?? 0) > MAX_LOG_LINES,
     },
   };
+}
+
+/* ---------- History enrichment ---------- */
+
+/** Default number of signatures `solEnrichHistory` resolves with `getTransaction`. */
+export const SOL_ENRICH_DEFAULT_LIMIT = 25;
+/** Default number of concurrent `getTransaction` calls in `solEnrichHistory`. */
+export const SOL_ENRICH_DEFAULT_CONCURRENCY = 3;
+/** Maximum number of normalised transactions kept in the in-module cache. */
+export const SOL_TX_CACHE_MAX = 500;
+
+/**
+ * Signature → normalised transaction. Insertion-ordered `Map` used as an
+ * LRU-ish cache: a hit re-inserts the entry so the oldest untouched signature
+ * is evicted first once `SOL_TX_CACHE_MAX` is exceeded.
+ */
+const txCache = new Map<string, Transaction>();
+/** In-flight fetches, so concurrent enrichments of the same signature share one request. */
+const txInFlight = new Map<string, Promise<Transaction>>();
+
+function cacheGet(signature: string): Transaction | undefined {
+  const hit = txCache.get(signature);
+  if (hit) {
+    txCache.delete(signature);
+    txCache.set(signature, hit);
+  }
+  return hit;
+}
+
+function cachePut(signature: string, tx: Transaction): void {
+  txCache.delete(signature);
+  txCache.set(signature, tx);
+  while (txCache.size > SOL_TX_CACHE_MAX) {
+    const oldest = txCache.keys().next().value;
+    if (oldest === undefined) break;
+    txCache.delete(oldest);
+  }
+}
+
+/** Drop every cached transaction (tests / settings changes). */
+export function clearSolTxCache(): void {
+  txCache.clear();
+  txInFlight.clear();
+}
+
+/** Number of transactions currently held in the enrichment cache. */
+export function solTxCacheSize(): number {
+  return txCache.size;
+}
+
+/** The caller's abort reason as an Error (`AbortError` when the signal carries none). */
+function abortReason(signal: AbortSignal): Error {
+  if (signal.reason instanceof Error) return signal.reason;
+  const e = new Error('aborted');
+  e.name = 'AbortError';
+  return e;
+}
+
+/**
+ * `solTransaction` through the in-module cache, deduplicating concurrent
+ * requests. The shared fetch is never bound to one caller's signal: an
+ * aborted caller rejects promptly with its own reason while the request
+ * completes for the other waiters and warms the cache.
+ */
+async function cachedSolTransaction(signature: string, signal?: AbortSignal): Promise<Transaction> {
+  const hit = cacheGet(signature);
+  if (hit) return hit;
+  if (signal?.aborted) throw abortReason(signal);
+  let pending = txInFlight.get(signature);
+  if (!pending) {
+    // Not bound to any caller's signal: one caller's abort must not reject the others.
+    pending = solTransaction(signature)
+      .then((tx) => {
+        cachePut(signature, tx);
+        return tx;
+      })
+      .finally(() => {
+        txInFlight.delete(signature);
+      });
+    pending.catch(() => undefined); // every waiter may have raced out on abort
+    txInFlight.set(signature, pending);
+  }
+  if (!signal) return pending;
+  const shared = pending;
+  return new Promise<Transaction>((resolve, reject) => {
+    const onAbort = () => reject(abortReason(signal));
+    signal.addEventListener('abort', onAbort, { once: true });
+    shared.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+/**
+ * One history row per native / SPL transfer of `tx` that touches `address`.
+ *
+ * - `direction` is `'out'` when `address` is the sender, `'in'` when it is the
+ *   receiver and `'self'` when both ends are the address.
+ * - Native rows carry the SOL amount; SPL rows additionally set `token`
+ *   (`kind: 'SPL'`, mint as `tokenAddress`, symbol / decimals from the
+ *   well-known mint table or the on-chain decimals).
+ * - `status` reflects `meta.err`, `timestamp` is the block time.
+ *
+ * Transfers that do not involve the address (e.g. the fee payer funding a
+ * third party) are ignored, so the result may be empty.
+ */
+export function solTransfersToRows(address: string, tx: Transaction): TxListItem[] {
+  const addr = address.trim();
+  const rows: TxListItem[] = [];
+  for (const t of tx.transfers ?? []) {
+    if (t.from !== addr && t.to !== addr) continue;
+    const isToken = t.kind === 'SPL';
+    const direction: TxListItem['direction'] = t.from === t.to ? 'self' : t.from === addr ? 'out' : 'in';
+    const row: TxListItem = {
+      chain: tx.chain,
+      hash: tx.hash,
+      timestamp: tx.timestamp,
+      blockNumber: tx.blockNumber,
+      from: t.from,
+      to: t.to,
+      value: t.amount,
+      status: tx.status,
+      methodName: tx.methodName,
+      direction,
+      enriched: true,
+    };
+    if (isToken) {
+      row.token = { symbol: t.amount.symbol, amount: t.amount, tokenAddress: t.token?.address, kind: t.kind };
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * Enrich signature rows (from `solSignatures`) with `getTransaction` details.
+ *
+ * Up to `opts.limit` (default 25) rows are resolved, `opts.concurrency`
+ * (default 3) at a time, through an in-module per-signature cache (max 500
+ * entries). Each resolved transaction is replaced by its `solTransfersToRows`
+ * rows; a transaction that moved nothing for the address keeps its original
+ * row (with `methodName` / `timestamp` filled in from the details). Rows whose
+ * fetch fails, rows beyond the limit and rows already marked `failed` are
+ * returned unchanged. Row order follows the input order.
+ */
+export async function solEnrichHistory(
+  address: string,
+  items: TxListItem[],
+  opts: { limit?: number; concurrency?: number; signal?: AbortSignal } = {},
+): Promise<TxListItem[]> {
+  const addr = address.trim();
+  const limit = Math.max(0, Math.floor(opts.limit ?? SOL_ENRICH_DEFAULT_LIMIT));
+  const concurrency = Math.max(1, Math.floor(opts.concurrency ?? SOL_ENRICH_DEFAULT_CONCURRENCY));
+  const { signal } = opts;
+
+  // Pick the rows to resolve: successful, well-formed signatures, in order, up to the limit.
+  const targets: number[] = [];
+  for (let i = 0; i < items.length && targets.length < limit; i++) {
+    const row = items[i];
+    if (!row || row.status === 'failed' || row.enriched) continue;
+    if (!/^[1-9A-HJ-NP-Za-km-z]{64,90}$/.test(row.hash ?? '')) continue;
+    targets.push(i);
+  }
+
+  const resolved = await mapLimit(targets, concurrency, async (index): Promise<TxListItem[] | undefined> => {
+    const row = items[index];
+    try {
+      const tx = await cachedSolTransaction(row.hash, signal);
+      const rows = solTransfersToRows(addr, tx);
+      if (rows.length > 0) return rows;
+      return [
+        {
+          ...row,
+          timestamp: tx.timestamp ?? row.timestamp,
+          blockNumber: tx.blockNumber ?? row.blockNumber,
+          status: tx.status,
+          methodName: row.methodName ?? tx.methodName,
+          enriched: true,
+        },
+      ];
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      return undefined;
+    }
+  });
+
+  const replacement = new Map<number, TxListItem[]>();
+  targets.forEach((index, n) => {
+    const rows = resolved[n];
+    if (rows) replacement.set(index, rows);
+  });
+
+  const out: TxListItem[] = [];
+  items.forEach((row, index) => {
+    const rows = replacement.get(index);
+    if (rows) out.push(...rows);
+    else out.push(row);
+  });
+  return out;
 }

@@ -16,8 +16,21 @@ vi.hoisted(() => {
   (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 });
 
-import type { AddressLabel, TokenBalance, TxListItem } from '@/lib/types';
-import { CHAINS, allChains, getChain } from '@/lib/chains/registry';
+// Capture CSV downloads instead of touching the DOM / blob URLs.
+// Pass-through mock so single tests can make the history pager fail.
+vi.mock('@/hooks/dispatch', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/dispatch')>();
+  return { ...actual, fetchHistoryPage: vi.fn(actual.fetchHistoryPage) };
+});
+
+vi.mock('@/lib/export', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('@/lib/export')>();
+  return { ...mod, downloadCsv: vi.fn() };
+});
+
+import type { AddressLabel, ApprovalScan, TokenBalance, TxListItem } from '@/lib/types';
+import { CHAINS, allChains, getChain, historyNeedsKey } from '@/lib/chains/registry';
+import { downloadCsv } from '@/lib/export';
 import { useSettings } from '@/lib/settings/store';
 import { useCases } from '@/lib/cases/store';
 import { registerLabels } from '@/lib/intel/labels';
@@ -27,7 +40,7 @@ import { RECENT_SEARCHES_KEY, RECENT_SEARCHES_MAX, addRecentSearch, clearRecentS
 import { applyTheme, nextTheme } from '@/hooks/useTheme';
 import { normalizePriceKeys, priceBalances, tokenPriceKey } from '@/hooks/usePrices';
 import { sortBalances } from '@/hooks/useTokenBalances';
-import { labelApprovals } from '@/hooks/useApprovals';
+import { labelApprovalScan, labelApprovals } from '@/hooks/useApprovals';
 import { buildRiskInput, counterpartyLabels } from '@/hooks/useRisk';
 import { toDraft, fromDraft, insecureRpcUrls } from '@/pages/SettingsPage';
 import App from '@/App';
@@ -49,7 +62,12 @@ import EmptyState from '@/components/EmptyState';
 import Card from '@/components/Card';
 import ChainSelect from '@/components/ChainSelect';
 import AddToCaseButton from '@/components/AddToCaseButton';
-import HomePage from '@/pages/HomePage';
+import HomePage, { KEY_HINT_TITLE, chainStripHint } from '@/pages/HomePage';
+import RiskFlags, { tokenizeEvidence } from '@/components/address/RiskFlags';
+import CounterpartiesCard, { aggregateCounterparties } from '@/components/address/CounterpartiesCard';
+import { historyCsvColumns } from '@/components/address/HistoryTable';
+import { approvalsCsvColumns } from '@/components/address/ApprovalsTab';
+import { tokensCsvColumns } from '@/components/address/TokensTab';
 import SettingsPage from '@/pages/SettingsPage';
 import CasesPage from '@/pages/CasesPage';
 import AboutPage from '@/pages/AboutPage';
@@ -462,6 +480,160 @@ describe('components', () => {
     expect(html).toContain('--chain-color: #627eea');
     expect(await render(<ChainBadge chain="bitcoin" showName />)).toContain('Bitcoin');
     expect(await render(<ChainBadge chain="nope" />)).toContain('nope');
+    expect(html).not.toContain('chain-badge__hint');
+  });
+
+  it('ChainBadge renders the key hint marker with its title', async () => {
+    const html = await render(<ChainBadge chain="bsc" showName hint="key" />);
+    expect(html).toContain('chain-badge--hint-key');
+    expect(html).toContain('chain-badge__hint--key');
+    expect(html).toContain('title="History needs an Etherscan API key"');
+    expect(html).toContain('aria-label="History needs an Etherscan API key"');
+    expect(html).toContain('<svg');
+    expect(await render(<ChainBadge chain="bsc" hint="key" hintTitle="Custom" />)).toContain('title="Custom"');
+  });
+
+  it('RiskFlags links tx hashes and addresses in the evidence and lists caveats', async () => {
+    const report = {
+      score: 30,
+      level: 'medium' as const,
+      flags: [{ id: 'large-value', level: 'none' as const, title: 'Large value', detail: 'd', evidence: [`${TX_HASH} · out 5 ETH`, `${ADDRESS} → ${USDC}`] }],
+    };
+    const html = await render(<RiskFlags report={report} loading={false} chain="ethereum" notes={['approvals not scanned: boom']} />);
+    expect(html).toContain(`href="/tx/ethereum/${TX_HASH}"`);
+    expect(html).toContain(`href="/address/ethereum/${ADDRESS}"`);
+    expect(html).toContain(`href="/address/ethereum/${USDC}"`);
+    expect(html).toContain('· out 5 ETH');
+    expect(html).toContain('0x742d…f44e');
+    expect(html).toContain('flag-notes');
+    expect(html).toContain('approvals not scanned: boom');
+    // Without a chain the evidence stays plain text; caveats still show on a clean report.
+    const plain = await render(<RiskFlags report={report} loading={false} />);
+    expect(plain).not.toContain('href="/tx/');
+    expect(plain).toContain(TX_HASH);
+    const clean = await render(<RiskFlags report={{ score: 0, level: 'none', flags: [] }} loading={false} notes={['approvals not scanned']} />);
+    expect(clean).toContain('No risk indicators found');
+    expect(clean).toContain('approvals not scanned');
+  });
+
+  it('tokenizeEvidence recognises identifiers per chain family and keeps the rest as text', () => {
+    const btcAddr = 'bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97';
+    const btcLegacy = '1FeexV6bAHb8ybZjqQMjJrcCrHGW9sb6uF';
+    const txid = 'b'.repeat(64);
+    const solAddr = 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4';
+    const sig = '5'.repeat(87);
+    expect(tokenizeEvidence(`${TX_HASH} · out`, 'evm')).toEqual([{ kind: 'tx', text: TX_HASH }, { kind: 'text', text: ' · out' }]);
+    expect(tokenizeEvidence(`${ADDRESS} → ${USDC}`, 'evm')).toEqual([{ kind: 'address', text: ADDRESS }, { kind: 'text', text: ' → ' }, { kind: 'address', text: USDC }]);
+    expect(tokenizeEvidence('balance 1.5 ETH', 'evm')).toEqual([{ kind: 'text', text: 'balance 1.5 ETH' }]);
+    expect(tokenizeEvidence('0x1234 short', 'evm')).toEqual([{ kind: 'text', text: '0x1234 short' }]);
+    expect(tokenizeEvidence(`${txid} from ${btcAddr}, ${btcLegacy}`, 'bitcoin')).toEqual([
+      { kind: 'tx', text: txid },
+      { kind: 'text', text: ' from ' },
+      { kind: 'address', text: btcAddr },
+      { kind: 'text', text: ', ' },
+      { kind: 'address', text: btcLegacy },
+    ]);
+    expect(tokenizeEvidence(`${sig} → ${solAddr}`, 'solana')).toEqual([{ kind: 'tx', text: sig }, { kind: 'text', text: ' → ' }, { kind: 'address', text: solAddr }]);
+    // Family patterns do not cross: an EVM hash is text on Bitcoin.
+    expect(tokenizeEvidence(TX_HASH, 'bitcoin')).toEqual([{ kind: 'text', text: TX_HASH }]);
+    expect(tokenizeEvidence('', 'evm')).toEqual([]);
+  });
+
+  it('aggregateCounterparties counts rows and sums native value per counterparty', () => {
+    const eth = { raw: 10n ** 18n, decimals: 18, symbol: 'ETH' };
+    const other = '0x2222222222222222222222222222222222222222';
+    const rows: TxListItem[] = [
+      { chain: 'ethereum', hash: '0x1', from: USDC.toLowerCase(), to: ADDRESS, value: eth, status: 'success', direction: 'in', timestamp: 10 },
+      { chain: 'ethereum', hash: '0x2', from: ADDRESS, to: USDC, value: { ...eth, raw: 2n * 10n ** 18n }, status: 'success', direction: 'out', timestamp: 20 },
+      { chain: 'ethereum', hash: '0x3', from: ADDRESS, to: USDC, value: { raw: 5n, decimals: 6, symbol: 'USDC' }, status: 'success', direction: 'out', token: { symbol: 'USDC', amount: { raw: 5n, decimals: 6, symbol: 'USDC' }, kind: 'ERC-20' } },
+      { chain: 'ethereum', hash: '0x4', from: other, to: ADDRESS, value: eth, status: 'success', direction: 'in' },
+      { chain: 'ethereum', hash: '0x5', from: ADDRESS, to: ADDRESS, value: eth, status: 'success', direction: 'self' },
+      { chain: 'ethereum', hash: '0x6', from: ADDRESS, value: eth, status: 'success', direction: 'unknown' },
+      { chain: 'ethereum', hash: '0x7', from: 'coinbase', to: ADDRESS, value: eth, status: 'success', direction: 'in' },
+      { chain: 'bitcoin', hash: 'b', from: `${other},${USDC}`, to: ADDRESS, value: eth, status: 'success', direction: 'in' },
+    ];
+    const top = aggregateCounterparties(rows, ADDRESS.toLowerCase());
+    expect(top.map((c) => [c.address, c.count, c.inRaw, c.outRaw, c.tokenCount, c.lastTs])).toEqual([
+      [USDC.toLowerCase(), 4, 10n ** 18n, 2n * 10n ** 18n, 1, 20],
+      [other, 2, 10n ** 18n, 0n, 0, undefined],
+    ]);
+    // The limit caps the list; folding is optional (case-sensitive chains).
+    expect(aggregateCounterparties(rows, ADDRESS, { limit: 1 })).toHaveLength(1);
+    expect(aggregateCounterparties(rows, ADDRESS, { fold: false }).map((c) => [c.address, c.count])).toEqual([[USDC, 3], [other, 2], [USDC.toLowerCase(), 1]]);
+    expect(aggregateCounterparties([], ADDRESS)).toEqual([]);
+  });
+
+  it('CounterpartiesCard surfaces a history error with Retry instead of the misleading empty state', async () => {
+    const fetchHistoryPageMock = vi.mocked(fetchHistoryPage);
+    const original = fetchHistoryPageMock.getMockImplementation();
+    // Only the tx pager fails; the token pager answers an empty page.
+    fetchHistoryPageMock.mockImplementation(async (_chain, _address, kind) => {
+      if (kind === 'tx') throw new Error('HTTP 429');
+      return { items: [], source: 'blockscout' };
+    });
+    const settle = async () => {
+      for (let i = 0; i < 20; i++) {
+        await act(async () => {
+          await new Promise((r) => setTimeout(r, 10));
+        });
+      }
+    };
+    try {
+      const m = await mount(<CounterpartiesCard chain={getChain('ethereum')} address={ADDRESS} />);
+      await settle();
+      const alert = m.container.querySelector<HTMLElement>('[role="alert"]');
+      expect(alert?.textContent).toContain('HTTP 429');
+      expect(m.container.textContent).not.toContain('No counterparties in the loaded rows');
+      const retry = Array.from(m.container.querySelectorAll<HTMLButtonElement>('button')).find((b) => b.textContent === 'Retry');
+      expect(retry).toBeDefined();
+
+      const kindsBefore = fetchHistoryPageMock.mock.calls.map((c) => c[2]);
+      expect(kindsBefore).toContain('tx');
+      expect(kindsBefore).toContain('token');
+      await act(async () => retry?.click());
+      await settle();
+      const kindsAfter = fetchHistoryPageMock.mock.calls.slice(kindsBefore.length).map((c) => c[2]);
+      // Only the pager that failed is refetched.
+      expect(kindsAfter).toEqual(['tx']);
+      expect(m.container.querySelector('[role="alert"]')?.textContent).toContain('HTTP 429');
+      m.unmount();
+    } finally {
+      if (original) fetchHistoryPageMock.mockImplementation(original);
+    }
+  });
+
+  it('labelApprovalScan labels the approvals and keeps the scan status', () => {
+    const tornado = '0xd90e2f925DA726b50C4Ed8D0Fb90Ad053324F31b';
+    const scan: ApprovalScan = {
+      approvals: [{ token: { chain: 'ethereum', address: USDC, name: 'USD Coin', symbol: 'USDC', decimals: 6, type: 'ERC-20' }, spender: tornado, amount: 1n, unlimited: false, txHash: TX_HASH }],
+      scanIncomplete: true,
+      fromBlock: 1,
+      toBlock: 2,
+      reason: 'refused',
+    };
+    const out = labelApprovalScan('ethereum', scan);
+    expect(out.approvals[0].spenderLabel).toMatch(/tornado/i);
+    expect(out).toMatchObject({ scanIncomplete: true, fromBlock: 1, toBlock: 2, reason: 'refused' });
+  });
+
+  it('CSV column sets serialise history, approvals and token rows', () => {
+    const eth = getChain('ethereum');
+    const row: TxListItem = { chain: 'ethereum', hash: TX_HASH, timestamp: 1_700_000_000, blockNumber: 5, from: ADDRESS, to: USDC, value: { raw: 1_500_000n, decimals: 6, symbol: 'USDC' }, status: 'success', direction: 'out', methodName: 'transfer', token: { symbol: 'USDC', amount: { raw: 1_500_000n, decimals: 6, symbol: 'USDC' }, tokenAddress: USDC, kind: 'ERC-20' } };
+    const cols = historyCsvColumns(eth, 'token');
+    expect(cols.map((c) => c.header)).toEqual(['chain', 'hash', 'timestamp', 'block', 'direction', 'from', 'to', 'amount', 'amount_raw', 'symbol', 'token_address', 'token_kind', 'method', 'status']);
+    expect(cols.map((c) => c.value(row))).toEqual(['ethereum', TX_HASH, '2023-11-14T22:13:20.000Z', 5, 'out', ADDRESS, USDC, '1.5', 1_500_000n, 'USDC', USDC, 'ERC-20', 'transfer', 'success']);
+    expect(historyCsvColumns(eth, 'tx').map((c) => c.header)).not.toContain('token_address');
+    expect(historyCsvColumns(getChain('solana'), 'tx').map((c) => c.header)).toEqual(expect.arrayContaining(['signature', 'slot', 'token_address']));
+    const approval = { token: { chain: 'ethereum', address: USDC, name: 'USD Coin', symbol: 'USDC', decimals: 6, type: 'ERC-20' as const }, spender: ADDRESS, amount: 2n ** 256n - 1n, unlimited: true, txHash: TX_HASH, timestamp: 1_700_000_000 };
+    const a = approvalsCsvColumns();
+    expect(a.find((c) => c.header === 'allowance')?.value(approval)).toBe('unlimited');
+    expect(a.find((c) => c.header === 'unlimited')?.value(approval)).toBe(true);
+    expect(a.find((c) => c.header === 'timestamp')?.value(approval)).toBe('2023-11-14T22:13:20.000Z');
+    const balance: TokenBalance = { token: approval.token, balance: 2_500_000n, usd: 2.5 };
+    const t = tokensCsvColumns();
+    expect(t.find((c) => c.header === 'balance')?.value(balance)).toBe('2.5');
+    expect(t.find((c) => c.header === 'usd')?.value(balance)).toBe('2.50');
+    expect(t.find((c) => c.header === 'usd')?.value({ ...balance, usd: undefined })).toBe('');
   });
 
   it('RiskBadge carries the test id and the level text', async () => {
@@ -528,6 +700,32 @@ describe('components', () => {
     expect(await render(<Timestamp />)).toContain('—');
   });
 
+  it('DataTable exports the loaded rows as CSV through downloadCsv', async () => {
+    const columns = [{ key: 'a', header: 'A', render: (r: { a: string; n: number }) => r.a }];
+    const exportColumns = [
+      { header: 'name', value: (r: { a: string; n: number }) => r.a },
+      { header: 'count', value: (r: { a: string; n: number }) => r.n },
+    ];
+    const rows = [
+      { a: 'one', n: 1 },
+      { a: 'two, "quoted"', n: 2 },
+    ];
+    const m = await mount(<DataTable columns={columns} rows={rows} rowKey={(r) => r.a} exportName="my export" exportColumns={exportColumns} footer={<span>foot</span>} />);
+    const button = m.container.querySelector<HTMLButtonElement>('button.table-export');
+    expect(button?.textContent).toBe('Export CSV');
+    expect(m.container.querySelector('.table-footer--split')?.textContent).toContain('foot');
+    await act(async () => button?.click());
+    expect(vi.mocked(downloadCsv)).toHaveBeenCalledTimes(1);
+    const [name, csv] = vi.mocked(downloadCsv).mock.calls[0];
+    expect(name).toBe('my export');
+    expect(csv).toBe('name,count\r\none,1\r\n"two, ""quoted""",2\r\n');
+    expect(csv.trimEnd().split('\r\n')).toHaveLength(3);
+    m.unmount();
+    // No button without rows or without export columns.
+    expect(await render(<DataTable columns={columns} rows={[]} rowKey={(r) => r.a} exportName="x" exportColumns={exportColumns} />)).not.toContain('table-export');
+    expect(await render(<DataTable columns={columns} rows={rows} rowKey={(r) => r.a} exportName="x" />)).not.toContain('table-export');
+  });
+
   it('DataTable renders rows, loading, error and empty states', async () => {
     const columns = [
       { key: 'a', header: 'A', render: (r: { a: string }) => r.a },
@@ -569,6 +767,7 @@ describe('components', () => {
     expect(await render(<LoadMore hasMore loading={false} onLoadMore={() => undefined} count={25} source="blockscout" />)).toMatch(/25 rows.*blockscout.*Load more/s);
     expect(await render(<Pagination hasMore={false} loading={false} onLoadMore={() => undefined} count={3} />)).toContain('End of results');
     expect(await render(<LoadMore hasMore loading onLoadMore={() => undefined} />)).toContain('Loading…');
+    expect(await render(<LoadMore hasMore={false} loading={false} onLoadMore={() => undefined} count={25} hint="enriching 0 of 25…" />)).toMatch(/25 rows · .*enriching 0 of 25…/s);
   });
 
   it('ErrorBox adds a Settings hint for provider / API key errors', async () => {
@@ -686,6 +885,25 @@ describe('pages', () => {
     expect(count(html, 'chain-badge__name')).toBeGreaterThanOrEqual(allChains(false).length);
     expect(html).toContain('Recent searches');
     expect(html).toContain(`href="/address/ethereum/${VITALIK}"`);
+  });
+
+  it('Home marks key-gated chains with a key hint until an Etherscan key is configured', async () => {
+    const keyed = allChains(false).filter(historyNeedsKey);
+    expect(keyed.length).toBeGreaterThan(0);
+    expect(chainStripHint(getChain('bsc'), undefined)).toBe('key');
+    expect(chainStripHint(getChain('bsc'), 'K')).toBeUndefined();
+    expect(chainStripHint(getChain('ethereum'), undefined)).toBeUndefined();
+
+    const html = await render(<HomePage />);
+    expect(count(html, 'chain-badge__hint--key')).toBe(keyed.length);
+    expect(html).toContain(`title="${KEY_HINT_TITLE}"`);
+    expect(html).toContain('chain-strip__note');
+    expect(html).toContain('href="/settings"');
+
+    useSettings.getState().set({ etherscanApiKey: 'KEY' });
+    const withKey = await render(<HomePage />);
+    expect(withKey).not.toContain('chain-badge__hint--key');
+    expect(withKey).not.toContain('chain-strip__note');
   });
 
   it('Home hides testnets unless enabled', async () => {

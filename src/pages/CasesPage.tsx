@@ -1,9 +1,16 @@
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+/**
+ * Investigation cases (SPEC §6 / §7): list, create, rename and delete cases,
+ * entities with tags and colours, notes, saved traces (attachments) and JSON
+ * export / import. Everything lives in the cases store (localStorage).
+ */
+import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 import { Link } from 'react-router-dom';
-import type { CaseEntity, InvestigationCase } from '@/lib/types';
-import { allChains } from '@/lib/chains/registry';
+import type { CaseAttachment, CaseEntity, InvestigationCase } from '@/lib/types';
+import { allChains, findChain } from '@/lib/chains/registry';
 import { useCases } from '@/lib/cases/store';
+import { downloadJson, safeFilename } from '@/lib/export';
 import { shorten } from '@/lib/format';
+import { traceQueryFor } from '@/pages/TracePage';
 import { usePageTitle } from '@/hooks/usePageTitle';
 import AddressDisplay from '@/components/AddressDisplay';
 import Card from '@/components/Card';
@@ -16,21 +23,89 @@ import { useToast } from '@/components/Toast';
 
 const TAG_COLORS = ['#f5b942', '#ff5c5c', '#3ddc97', '#58a6ff', '#c084fc', '#f472b6', '#94a3b8'];
 
-function download(filename: string, text: string): void {
-  if (typeof document === 'undefined') return;
-  const blob = new Blob([text], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
 function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'case';
+}
+
+export interface AttachmentStats {
+  nodes: number;
+  edges: number;
+  /** Hops actually reached, when the graph stats carry it. */
+  hops?: number;
+  /** Set when `data` could not be parsed as a flow export. */
+  error?: string;
+}
+
+/** Node / edge counts of a saved trace; parsed on demand, never throws. */
+export function attachmentStats(data: string): AttachmentStats {
+  try {
+    const parsed: unknown = JSON.parse(data);
+    const graph = parsed && typeof parsed === 'object' && 'graph' in parsed ? (parsed as { graph: unknown }).graph : parsed;
+    if (!graph || typeof graph !== 'object') return { nodes: 0, edges: 0, error: 'Not a trace export' };
+    const g = graph as { nodes?: unknown; edges?: unknown; stats?: { hops?: unknown } };
+    if (!Array.isArray(g.nodes) || !Array.isArray(g.edges)) return { nodes: 0, edges: 0, error: 'Not a trace export' };
+    const hops = typeof g.stats?.hops === 'number' ? g.stats.hops : undefined;
+    return hops === undefined ? { nodes: g.nodes.length, edges: g.edges.length } : { nodes: g.nodes.length, edges: g.edges.length, hops };
+  } catch {
+    return { nodes: 0, edges: 0, error: 'Unreadable attachment data' };
+  }
+}
+
+/** Route that reopens the tracer with the attachment's root and options. */
+export function attachmentTraceLink(a: Pick<CaseAttachment, 'chain' | 'root' | 'options'>): string {
+  return `/trace/${a.chain}/${a.root}?${traceQueryFor(a.options)}`;
+}
+
+function describeOptions(o: CaseAttachment['options']): string {
+  const dir = o.direction === 'both' ? 'both directions' : o.direction === 'in' ? 'incoming' : 'outgoing';
+  const parts = [`${o.maxHops} hop${o.maxHops === 1 ? '' : 's'}`, `fan-out ${o.maxFanOut}`, dir];
+  if (o.minUsd) parts.push(`min $${o.minUsd}`);
+  parts.push(o.includeTokens ? 'with tokens' : 'native only');
+  if (o.stopAtLabelled) parts.push('stops at labels');
+  return parts.join(' · ');
+}
+
+function AttachmentRow({ c, a }: { c: InvestigationCase; a: CaseAttachment }) {
+  const removeAttachment = useCases((s) => s.removeAttachment);
+  const toast = useToast();
+  const stats = useMemo(() => attachmentStats(a.data), [a.data]);
+  const chain = findChain(a.chain);
+  const doDownload = () => {
+    try {
+      downloadJson(safeFilename(`loxdetective-trace-${a.chain}-${shorten(a.root, 6, 4).replace('…', '-')}`), a.data);
+      toast.push('Trace JSON downloaded', 'success');
+    } catch (err) {
+      toast.push(err instanceof Error ? err.message : 'Download failed', 'error');
+    }
+  };
+  return (
+    <li className="note attachment" data-testid="case-attachment">
+      <div className="note__text">
+        <strong>{a.title}</strong>
+        <div className="attachment__meta muted small">
+          {chain ? <ChainBadge chain={chain} size="sm" showName /> : <span className="chip chip--other">{a.chain}</span>}{' '}
+          <AddressDisplay address={a.root} chain={a.chain} copy />
+        </div>
+        <div className="muted small" data-testid="case-attachment-stats">
+          {stats.error ? stats.error : `${stats.nodes} address${stats.nodes === 1 ? '' : 'es'} · ${stats.edges} edge${stats.edges === 1 ? '' : 's'}`} · {describeOptions(a.options)}
+        </div>
+      </div>
+      <div className="note__meta">
+        <Timestamp ts={Math.floor(a.createdAt / 1000)} mode="both" />
+        <span className="btn-row">
+          <Link className="btn btn--sm" to={attachmentTraceLink(a)} data-testid="case-attachment-open">
+            Open trace
+          </Link>
+          <button type="button" className="btn btn--sm" onClick={doDownload}>
+            Download JSON
+          </button>
+          <button type="button" className="btn btn--sm btn--ghost" onClick={() => removeAttachment(c.id, a.id)} aria-label={`Remove attachment ${a.title}`}>
+            Remove
+          </button>
+        </span>
+      </div>
+    </li>
+  );
 }
 
 function EntityRow({ c, e }: { c: InvestigationCase; e: CaseEntity }) {
@@ -97,6 +172,7 @@ function CaseDetail({ c }: { c: InvestigationCase }) {
   const [entityValue, setEntityValue] = useState('');
   const [entityChain, setEntityChain] = useState('ethereum');
   const [entityKind, setEntityKind] = useState<CaseEntity['kind']>('address');
+  const attachments = c.attachments ?? [];
 
   const submitNote = (e: FormEvent) => {
     e.preventDefault();
@@ -115,7 +191,7 @@ function CaseDetail({ c }: { c: InvestigationCase }) {
 
   const doExport = () => {
     try {
-      download(`loxdetective-${slug(c.title)}.json`, exportCase(c.id));
+      downloadJson(`loxdetective-${slug(c.title)}`, exportCase(c.id));
       toast.push('Case exported', 'success');
     } catch (err) {
       toast.push(err instanceof Error ? err.message : 'Export failed', 'error');
@@ -163,6 +239,7 @@ function CaseDetail({ c }: { c: InvestigationCase }) {
       </div>
       <p className="muted case-detail__meta">
         Created <Timestamp ts={Math.floor(c.createdAt / 1000)} /> · updated <Timestamp ts={Math.floor(c.updatedAt / 1000)} /> · {c.entities.length} entit{c.entities.length === 1 ? 'y' : 'ies'} · {c.notes.length} note{c.notes.length === 1 ? '' : 's'}
+        {attachments.length > 0 && ` · ${attachments.length} saved trace${attachments.length === 1 ? '' : 's'}`}
       </p>
 
       <Card title="Entities" subtitle="Addresses and transactions in this case. Tags show up as labels everywhere in the app.">
@@ -186,6 +263,18 @@ function CaseDetail({ c }: { c: InvestigationCase }) {
             Add
           </button>
         </form>
+      </Card>
+
+      <Card title="Saved traces" subtitle="Fund-flow graphs stored with this case. Reopen one to re-run it with the same options, or download the graph JSON.">
+        {attachments.length === 0 ? (
+          <EmptyState compact title="No saved traces" hint='Run a trace and press "Save trace to case" on the tracer page.' />
+        ) : (
+          <ul className="note-list attachment-list">
+            {attachments.map((a) => (
+              <AttachmentRow key={a.id} c={c} a={a} />
+            ))}
+          </ul>
+        )}
       </Card>
 
       <Card title="Notes">
@@ -330,6 +419,7 @@ export default function CasesPage() {
                       <span className="case-list__title">{c.title}</span>
                       <span className="case-list__meta muted">
                         {c.entities.length} entit{c.entities.length === 1 ? 'y' : 'ies'} · {c.notes.length} note{c.notes.length === 1 ? '' : 's'}
+                        {c.attachments?.length ? ` · ${c.attachments.length} trace${c.attachments.length === 1 ? '' : 's'}` : ''}
                       </span>
                     </button>
                   </li>

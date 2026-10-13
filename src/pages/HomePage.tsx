@@ -1,11 +1,12 @@
 import { Link, useNavigate } from 'react-router-dom';
-import { allChains } from '@/lib/chains/registry';
+import type { ChainInfo } from '@/lib/types';
+import { allChains, historyNeedsKey } from '@/lib/chains/registry';
 import { useSettings } from '@/lib/settings/store';
 import { useRecentSearches } from '@/hooks/useRecentSearches';
 import { usePageTitle } from '@/hooks/usePageTitle';
 import { searchPath } from '@/components/SearchBar';
 import SearchBar from '@/components/SearchBar';
-import ChainBadge from '@/components/ChainBadge';
+import ChainBadge, { KeyIcon } from '@/components/ChainBadge';
 import Timestamp from '@/components/Timestamp';
 
 interface Feature {
@@ -92,9 +93,17 @@ const EXAMPLES: { label: string; query: string }[] = [
   { label: 'Jupiter v6 (Solana)', query: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4' },
 ];
 
+export const KEY_HINT_TITLE = 'History needs an Etherscan API key';
+
+/** Chains whose history is key-gated while no key is configured get a key marker in the strip. */
+export function chainStripHint(chain: ChainInfo, etherscanApiKey: string | undefined): 'key' | undefined {
+  return historyNeedsKey(chain) && !(etherscanApiKey ?? '').trim() ? 'key' : undefined;
+}
+
 export default function HomePage() {
   usePageTitle();
   const showTestnets = useSettings((s) => s.showTestnets);
+  const etherscanApiKey = useSettings((s) => s.etherscanApiKey);
   const chains = allChains(showTestnets);
   const { recent, remove, clear } = useRecentSearches();
   const navigate = useNavigate();
@@ -167,9 +176,17 @@ export default function HomePage() {
         </div>
         <div className="chain-strip">
           {chains.map((c) => (
-            <ChainBadge key={c.id} chain={c} showName />
+            <ChainBadge key={c.id} chain={c} showName hint={chainStripHint(c, etherscanApiKey)} hintTitle={KEY_HINT_TITLE} />
           ))}
         </div>
+        {chains.some((c) => chainStripHint(c, etherscanApiKey)) && (
+          <p className="muted small chain-strip__note">
+            <span className="chain-badge__hint chain-badge__hint--inline" aria-hidden="true">
+              <KeyIcon />
+            </span>{' '}
+            {KEY_HINT_TITLE} — balances and approvals work without one. <Link to="/settings">Add a key in Settings.</Link>
+          </p>
+        )}
       </section>
 
       <section className="section section--note">

@@ -6,20 +6,26 @@
  * `loxdetective.cases.v1`; entity tags are also published to the label
  * registry (`registerLabels`) so they show up across the UI like any other
  * known-address label, and withdrawn again (`unregisterLabels`) when the tag,
- * the entity or the whole case is removed.
+ * the entity or the whole case is removed. Fund-flow traces can be attached
+ * to a case (`addAttachment`) as serialised graphs, capped at
+ * `CASE_ATTACHMENT_MAX_BYTES` each; they travel with the case export.
  */
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { registerLabels, unregisterLabels } from '@/lib/intel/labels';
-import type { AddressLabel, CaseEntity, CaseNote, ChainId, InvestigationCase } from '@/lib/types';
+import type { AddressLabel, CaseAttachment, CaseEntity, CaseNote, ChainId, InvestigationCase, TraceOptions } from '@/lib/types';
 
 export const CASES_STORAGE_KEY = 'loxdetective.cases.v1';
 /** Marker written into exported case files so they can be recognised on import. */
 export const CASE_EXPORT_FORMAT = 'loxdetective-case';
 export const CASE_EXPORT_VERSION = 1;
+/** Upper bound for one attachment's `data` (the serialised trace graph), in bytes. */
+export const CASE_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TITLE = 'Untitled case';
+const TRACE_DIRECTIONS: ReadonlySet<string> = new Set(['in', 'out', 'both']);
 
 export type NewCaseEntity = Omit<CaseEntity, 'id' | 'addedAt'>;
+export type NewCaseAttachment = Omit<CaseAttachment, 'id' | 'createdAt'>;
 
 export interface CasesState {
   cases: InvestigationCase[];
@@ -38,9 +44,21 @@ export interface CasesState {
   tagEntity(caseId: string, entityId: string, tag?: string, color?: string): void;
   addNote(caseId: string, text: string): void;
   deleteNote(caseId: string, noteId: string): void;
+  /**
+   * Saves a trace into a case. Returns the stored attachment, or undefined for
+   * an unknown case. Throws when the attachment is malformed, its `data`
+   * exceeds `CASE_ATTACHMENT_MAX_BYTES`, or the browser storage refuses it.
+   */
+  addAttachment(caseId: string, a: NewCaseAttachment): CaseAttachment | undefined;
+  removeAttachment(caseId: string, attachmentId: string): void;
   /** Pretty-printed JSON case file; throws `Error('Case not found')`. */
   exportCase(id: string): string;
-  /** Parses a case file (as produced by `exportCase`, or a bare case object); throws `Error('Invalid case file')`. */
+  /**
+   * Parses a case file (as produced by `exportCase`, or a bare case object) and
+   * adds it as a new case; throws `Error('Invalid case file')`, or an error
+   * starting with "Could not import the case" when the browser storage refuses
+   * the write (the in-memory list is then left unchanged).
+   */
   importCase(json: string): InvestigationCase;
 }
 
@@ -87,6 +105,13 @@ export function newId(): string {
   if (c && typeof c.randomUUID === 'function') return c.randomUUID();
   const rnd = () => Math.random().toString(36).slice(2, 10);
   return `${Date.now().toString(36)}-${rnd()}-${rnd()}`;
+}
+
+/** Copy without `undefined`-valued keys (so an emptied optional collection disappears instead of lingering). */
+function stripUndefined<T extends object>(obj: T): T {
+  const out = { ...obj } as Record<string, unknown>;
+  for (const k of Object.keys(out)) if (out[k] === undefined) delete out[k];
+  return out as T;
 }
 
 function cleanTitle(title: unknown): string {
@@ -174,15 +199,56 @@ function parseNote(raw: unknown, now: number): CaseNote | undefined {
   return { id: optStr(raw.id) ?? newId(), createdAt: numOr(raw.createdAt, now), text: raw.text };
 }
 
+/** Size of an attachment payload in bytes (UTF-8), falling back to the string length. */
+export function attachmentBytes(data: string): number {
+  try {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(data).length;
+  } catch {
+    /* fall through */
+  }
+  return data.length;
+}
+
+/** Validates the trace options of an attachment; returns undefined for a wrong shape. */
+function parseTraceOptions(raw: unknown): CaseAttachment['options'] | undefined {
+  if (!isObj(raw)) return undefined;
+  const { maxHops, maxFanOut, direction, stopAtLabelled, includeTokens, minUsd } = raw;
+  if (typeof maxHops !== 'number' || !Number.isFinite(maxHops)) return undefined;
+  if (typeof maxFanOut !== 'number' || !Number.isFinite(maxFanOut)) return undefined;
+  if (!isStr(direction) || !TRACE_DIRECTIONS.has(direction)) return undefined;
+  if (typeof stopAtLabelled !== 'boolean' || typeof includeTokens !== 'boolean') return undefined;
+  if (minUsd !== undefined && (typeof minUsd !== 'number' || !Number.isFinite(minUsd))) return undefined;
+  const out: CaseAttachment['options'] = { maxHops, maxFanOut, direction: direction as TraceOptions['direction'], stopAtLabelled, includeTokens };
+  if (minUsd !== undefined) out.minUsd = minUsd;
+  return out;
+}
+
+/**
+ * Validates an untrusted attachment: kind 'trace', non-empty title / chain /
+ * root, well-formed options and a string `data` within the size cap. Ids and
+ * timestamps are preserved when present.
+ */
+export function parseAttachment(raw: unknown, now = Date.now()): CaseAttachment | undefined {
+  if (!isObj(raw) || raw.kind !== 'trace') return undefined;
+  const title = optStr(raw.title);
+  const chain = optStr(raw.chain);
+  const root = optStr(raw.root);
+  const options = parseTraceOptions(raw.options);
+  if (!title || !chain || !root || !options || !isStr(raw.data)) return undefined;
+  if (attachmentBytes(raw.data) > CASE_ATTACHMENT_MAX_BYTES) return undefined;
+  return { id: optStr(raw.id) ?? newId(), kind: 'trace', title, createdAt: numOr(raw.createdAt, now), chain, root, options, data: raw.data };
+}
+
 /**
  * Validates an untrusted case object. Returns undefined when the shape is
  * wrong (title string, entities array of {chain, kind, value}, optional notes
  * array of {text}). Ids and timestamps are preserved when present, entities
  * are deduped by id and duplicate note ids are regenerated.
  */
-function parseCase(raw: unknown): InvestigationCase | undefined {
+function parseCase(raw: unknown, opts: { dropBadAttachments?: boolean } = {}): InvestigationCase | undefined {
   if (!isObj(raw) || !isStr(raw.title) || !Array.isArray(raw.entities)) return undefined;
   if (raw.notes !== undefined && !Array.isArray(raw.notes)) return undefined;
+  if (raw.attachments !== undefined && !Array.isArray(raw.attachments)) return undefined;
   const now = Date.now();
 
   const entities: CaseEntity[] = [];
@@ -205,8 +271,21 @@ function parseCase(raw: unknown): InvestigationCase | undefined {
     notes.push(n);
   }
 
+  const attachments: CaseAttachment[] = [];
+  const attachmentIds = new Set<string>();
+  for (const item of raw.attachments ?? []) {
+    const a = parseAttachment(item, now);
+    if (!a) {
+      if (opts.dropBadAttachments) continue;
+      return undefined;
+    }
+    if (attachmentIds.has(a.id)) a.id = newId();
+    attachmentIds.add(a.id);
+    attachments.push(a);
+  }
+
   const createdAt = numOr(raw.createdAt, now);
-  return {
+  const out: InvestigationCase = {
     id: optStr(raw.id) ?? newId(),
     title: cleanTitle(raw.title),
     createdAt,
@@ -214,15 +293,17 @@ function parseCase(raw: unknown): InvestigationCase | undefined {
     entities,
     notes,
   };
+  if (attachments.length) out.attachments = attachments;
+  return out;
 }
 
-/** Tolerant version of `parseCase` for storage: drops broken cases instead of failing hydration. */
+/** Tolerant version of `parseCase` for storage: drops broken cases (and broken attachments) instead of failing hydration. */
 function sanitizePersisted(raw: unknown): PersistedCases {
   if (!isObj(raw) || !Array.isArray(raw.cases)) return { cases: [], activeCaseId: undefined };
   const cases: InvestigationCase[] = [];
   const ids = new Set<string>();
   for (const item of raw.cases) {
-    const c = parseCase(item);
+    const c = parseCase(item, { dropBadAttachments: true });
     if (c && !ids.has(c.id)) {
       ids.add(c.id);
       cases.push(c);
@@ -242,7 +323,7 @@ export const useCases = create<CasesState>()(
       const find = (id: string): InvestigationCase | undefined => get().cases.find((c) => c.id === id);
       /** Applies a partial update to one case and bumps its `updatedAt`. No-op for unknown ids. */
       const patch = (id: string, fn: (c: InvestigationCase) => Partial<InvestigationCase>): void => {
-        set((s) => ({ cases: s.cases.map((c) => (c.id === id ? { ...c, ...fn(c), updatedAt: Date.now() } : c)) }));
+        set((s) => ({ cases: s.cases.map((c) => (c.id === id ? stripUndefined({ ...c, ...fn(c), updatedAt: Date.now() }) : c)) }));
       };
 
       return {
@@ -312,6 +393,35 @@ export const useCases = create<CasesState>()(
 
         deleteNote: (caseId, noteId) => patch(caseId, (c) => ({ notes: c.notes.filter((n) => n.id !== noteId) })),
 
+        addAttachment: (caseId, a) => {
+          const target = find(caseId);
+          if (!target) return undefined;
+          if (!isObj(a) || !isStr(a.data)) throw new Error('Invalid attachment');
+          if (attachmentBytes(a.data) > CASE_ATTACHMENT_MAX_BYTES) {
+            throw new Error(`Attachment too large (${(attachmentBytes(a.data) / 1024 / 1024).toFixed(1)} MB; the limit is ${CASE_ATTACHMENT_MAX_BYTES / 1024 / 1024} MB)`);
+          }
+          const attachment = parseAttachment({ ...a, id: newId(), createdAt: Date.now() });
+          if (!attachment) throw new Error('Invalid attachment');
+          const before = target.attachments ?? [];
+          try {
+            patch(caseId, (c) => ({ attachments: [...(c.attachments ?? []), attachment] }));
+          } catch (err) {
+            // The persist middleware writes synchronously; a full localStorage throws here. Roll back the in-memory state.
+            patch(caseId, () => (before.length ? { attachments: before } : { attachments: undefined }));
+            throw new Error(`Could not save the attachment: browser storage is full or unavailable (${err instanceof Error ? err.message : String(err)})`);
+          }
+          return attachment;
+        },
+
+        removeAttachment: (caseId, attachmentId) => {
+          const c = find(caseId);
+          if (!c?.attachments?.some((a) => a.id === attachmentId)) return;
+          patch(caseId, (cur) => {
+            const rest = (cur.attachments ?? []).filter((a) => a.id !== attachmentId);
+            return rest.length ? { attachments: rest } : { attachments: undefined };
+          });
+        },
+
         exportCase: (id) => {
           const c = find(id);
           if (!c) throw new Error('Case not found');
@@ -331,7 +441,18 @@ export const useCases = create<CasesState>()(
           const base = parseCase(raw);
           if (!base) throw new Error('Invalid case file');
           const c: InvestigationCase = { ...base, id: newId(), updatedAt: Date.now() };
-          set((s) => ({ cases: [...s.cases, c] }));
+          const before = get().cases;
+          try {
+            set((s) => ({ cases: [...s.cases, c] }));
+          } catch (err) {
+            // The persist middleware writes synchronously; a full localStorage throws here. Roll back the in-memory state.
+            try {
+              set({ cases: before });
+            } catch {
+              /* storage still broken; the rollback is best-effort */
+            }
+            throw new Error(`Could not import the case: browser storage is full or unavailable (${err instanceof Error ? err.message : String(err)})`);
+          }
           publishLabels(c.entities);
           return c;
         },

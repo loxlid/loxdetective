@@ -1,6 +1,10 @@
+import { useMemo } from 'react';
+import { Link } from 'react-router-dom';
 import type { ApprovalInfo, ChainInfo } from '@/lib/types';
+import type { CsvColumn } from '@/lib/export';
+import { formatAmount } from '@/lib/format';
 import { lookupLabel } from '@/lib/intel/labels';
-import { useApprovals } from '@/hooks/useApprovals';
+import { scannedSpan, useApprovalScan } from '@/hooks/useApprovals';
 import { useLabelsRevision } from '@/hooks/useLabel';
 import AddressDisplay from '@/components/AddressDisplay';
 import AmountCell from '@/components/AmountCell';
@@ -20,13 +24,32 @@ function RiskHint({ approval, chain }: { approval: ApprovalInfo; chain: ChainInf
   return <span className="muted">—</span>;
 }
 
-/** Live token allowances granted by the address (EVM). */
+/** CSV columns of the approvals table. */
+export function approvalsCsvColumns(): CsvColumn<ApprovalInfo>[] {
+  return [
+    { header: 'token_symbol', value: (a) => a.token.symbol },
+    { header: 'token_address', value: (a) => a.token.address },
+    { header: 'token_type', value: (a) => a.token.type },
+    { header: 'spender', value: (a) => a.spender },
+    { header: 'spender_label', value: (a) => a.spenderLabel },
+    { header: 'allowance', value: (a) => (a.unlimited ? 'unlimited' : formatAmount(a.amount, a.token.decimals, 18)) },
+    { header: 'allowance_raw', value: (a) => a.amount },
+    { header: 'unlimited', value: (a) => a.unlimited },
+    { header: 'tx_hash', value: (a) => a.txHash },
+    { header: 'timestamp', value: (a) => (a.timestamp ? new Date(a.timestamp * 1000).toISOString() : '') },
+    { header: 'block', value: (a) => a.blockNumber },
+  ];
+}
+
+/** Live token allowances granted by the address (EVM), with the scan coverage. */
 export default function ApprovalsTab({ chain, address }: { chain: ChainInfo; address: string }) {
-  const q = useApprovals(chain.id, address);
+  const q = useApprovalScan(chain.id, address);
   // Re-render when labels change (feed load, case tags) so the hints stay current.
   useLabelsRevision();
-  const rows = q.data ?? [];
+  const scan = q.data;
+  const rows = scan?.approvals ?? [];
   const risky = rows.filter((a) => a.unlimited && !a.spenderLabel && !lookupLabel(a.spender, chain.id)).length;
+  const exportColumns = useMemo(() => approvalsCsvColumns(), []);
 
   const columns: Column<ApprovalInfo>[] = [
     { key: 'token', header: 'Token', render: (a) => <TokenName token={a.token} chain={chain} /> },
@@ -61,10 +84,20 @@ export default function ApprovalsTab({ chain, address }: { chain: ChainInfo; add
 
   const subtitle = rows.length
     ? `${rows.length} active allowance${rows.length === 1 ? '' : 's'}${risky ? ` · ${risky} unlimited to unlabelled spender${risky === 1 ? '' : 's'}` : ''}`
-    : undefined;
+    : scan?.scanIncomplete
+      ? 'Scan incomplete'
+      : undefined;
+  const span = scannedSpan(scan);
 
   return (
     <Card title="Token approvals" subtitle={subtitle} flush>
+      {scan?.scanIncomplete && (
+        <div className="banner banner--warn" role="alert" data-testid="approvals-incomplete">
+          <strong>Approval scan incomplete.</strong> {scan.reason ?? 'The RPC refused part of the log query.'}{' '}
+          {rows.length ? 'The allowances below come from the part that was scanned; others may exist.' : 'No allowance can be ruled out.'}{' '}
+          <Link to="/settings">Add a custom RPC in Settings</Link> (an archive node or a provider with a larger eth_getLogs range) and retry.
+        </div>
+      )}
       <DataTable
         columns={columns}
         rows={rows}
@@ -72,11 +105,18 @@ export default function ApprovalsTab({ chain, address }: { chain: ChainInfo; add
         loading={q.isLoading}
         error={q.error ?? undefined}
         onRetry={() => void q.refetch()}
-        emptyTitle="No active approvals found"
-        emptyHint="No Approval / ApprovalForAll events were found for this address in the scanned block range, or every allowance was revoked."
+        emptyTitle={scan?.scanIncomplete ? 'No approvals in the scanned part' : 'No active approvals found'}
+        emptyHint={
+          scan?.scanIncomplete
+            ? 'Part of the block range was not scanned (see the warning above), so this is not a clean result.'
+            : 'No Approval / ApprovalForAll events were found for this address in the scanned block range, or every allowance was revoked.'
+        }
         caption={`Token approvals granted by ${address} on ${chain.name}`}
+        exportName={`${chain.id}-${address}-approvals`}
+        exportColumns={exportColumns}
         footer={
           <span className="muted small">
+            {span ? <span className="approvals-span">{span}. </span> : null}
             Scanned from Approval / ApprovalForAll logs of the last ~2,000,000 blocks via RPC; revoked (zero) allowances are omitted. Use a revoke tool to remove risky allowances.
           </span>
         }

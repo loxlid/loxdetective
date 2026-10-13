@@ -476,6 +476,10 @@ a.chip:hover { text-decoration: none; filter: brightness(1.15); }
 .note__text { white-space: pre-wrap; overflow-wrap: anywhere; }
 .note__meta { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; font-size: 0.8rem; }
 .note-add { display: grid; gap: 4px; }
+/* Saved trace rows (Cases page): the title stays on its own line, chain + root wrap below it. */
+.attachment .note__text { white-space: normal; display: grid; gap: 4px; }
+.attachment__meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.attachment .note__meta { flex-wrap: wrap; }
 .add-to-case { display: inline-flex; gap: 6px; align-items: center; }
 
 /* ---------- Generic page helpers for the data pages ---------- */
@@ -494,3 +498,13 @@ pre.code {
 .status--failed { color: var(--danger); }
 .status--pending { color: var(--warn); }
 .about-page .table td { white-space: normal; }
+
+/* ---------- Chain badge hints, table export ---------- */
+.chain-badge__hint { display: inline-flex; align-items: center; color: var(--warn); margin-left: 2px; }
+.chain-badge__hint svg { width: 11px; height: 11px; }
+.chain-badge--lg .chain-badge__hint svg { width: 13px; height: 13px; }
+.chain-badge__hint--inline { vertical-align: middle; }
+.chain-strip__note { margin: 10px 0 0; }
+.table-footer--split { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.table-footer__main { flex: 1 1 auto; min-width: 0; }
+.table-export { flex: none; }

@@ -1,6 +1,8 @@
+import { useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChainInfo, TokenBalance, TokenInfo } from '@/lib/types';
-import { formatUsd } from '@/lib/format';
+import type { CsvColumn } from '@/lib/export';
+import { formatAmount, formatUsd } from '@/lib/format';
 import { useTokenBalances } from '@/hooks/useTokenBalances';
 import AddressDisplay from '@/components/AddressDisplay';
 import AmountCell from '@/components/AmountCell';
@@ -19,9 +21,24 @@ export function TokenName({ token, chain }: { token: TokenInfo; chain: ChainInfo
   );
 }
 
+/** CSV columns of the token balances table. */
+export function tokensCsvColumns(): CsvColumn<TokenBalance>[] {
+  return [
+    { header: 'symbol', value: (b) => b.token.symbol },
+    { header: 'name', value: (b) => b.token.name },
+    { header: 'type', value: (b) => b.token.type },
+    { header: 'contract', value: (b) => b.token.address },
+    { header: 'balance', value: (b) => formatAmount(b.balance, b.token.decimals, 18) },
+    { header: 'balance_raw', value: (b) => b.balance },
+    { header: 'decimals', value: (b) => b.token.decimals },
+    { header: 'usd', value: (b) => (b.usd === undefined ? '' : b.usd.toFixed(2)) },
+  ];
+}
+
 /** Token balances with USD values and a total. */
 export default function TokensTab({ chain, address }: { chain: ChainInfo; address: string }) {
   const q = useTokenBalances(chain.id, address);
+  const exportColumns = useMemo(() => tokensCsvColumns(), []);
   const rows = q.data ?? [];
   const priced = rows.filter((b) => b.usd !== undefined);
   const total = priced.reduce((s, b) => s + (b.usd ?? 0), 0);
@@ -50,6 +67,8 @@ export default function TokensTab({ chain, address }: { chain: ChainInfo; addres
         emptyTitle="No token balances"
         emptyHint="No fungible or NFT balances were found for this address."
         caption={`Token balances of ${address} on ${chain.name}`}
+        exportName={`${chain.id}-${address}-tokens`}
+        exportColumns={exportColumns}
         footer={rows.length ? <span className="muted small">Prices via DefiLlama; tokens without a known price are listed last.</span> : undefined}
       />
     </Card>
