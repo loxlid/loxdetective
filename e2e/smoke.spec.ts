@@ -8,9 +8,9 @@
  * the end that none occurred (resource 404s and favicon noise are tolerated).
  *
  * The data-testids used here are the UI contract documented in
- * docs/UI_TESTIDS.md (the 28 core ids plus the additive round-2 ids).
+ * docs/UI_TESTIDS.md (the 28 core ids plus the additive round-2 and round-3 ids).
  */
-import { ADDRESS, CASES_KEY, CUSTOM_RPC, escapeRegExp, EVM_MAINNET_CHAINS, expect, expectNoConsoleErrors, hashRoute, LOAD_TIMEOUT, overrideRpc, rpcErrorFor, SETTINGS_KEY, test, TX_HASH } from './mocks';
+import { ADDRESS, CASES_KEY, CUSTOM_RPC, escapeRegExp, EVM_MAINNET_CHAINS, expect, expectNoConsoleErrors, hashRoute, LABELS_KEY, LOAD_TIMEOUT, overrideRpc, rpcErrorFor, SETTINGS_KEY, test, TX_HASH } from './mocks';
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -183,6 +183,30 @@ test.describe('LoxDetective smoke', () => {
     await expect(page.getByTestId('trace-page')).toBeVisible();
     await expect(page.getByTestId('trace-max-hops')).toHaveValue('2');
     await expect(page.getByTestId('trace-max-fanout')).toHaveValue('8');
+    expectNoConsoleErrors(consoleErrors);
+  });
+
+  test('a custom label imported in Settings shows as a chip on the address profile', async ({ page, consoleErrors }) => {
+    const wallet = '0x1111111111111111111111111111111111111111';
+    await page.goto(hashRoute('/settings'));
+    await expect(page.getByTestId('settings-page')).toBeVisible({ timeout: LOAD_TIMEOUT });
+
+    await page.getByTestId('settings-labels-csv').fill(`${wallet},My test wallet,wallet,evm`);
+    await page.getByTestId('settings-labels-import').click();
+    await expect(page.getByTestId('settings-labels-count')).toContainText('1 custom label active');
+    await expect(page.getByTestId('settings-labels-errors')).toHaveCount(0);
+    await expect.poll(() => page.evaluate((key) => localStorage.getItem(key), LABELS_KEY)).toContain('My test wallet');
+
+    await page.goto(hashRoute(`/address/ethereum/${wallet}`));
+    await expect(page.getByTestId('address-page')).toBeVisible({ timeout: LOAD_TIMEOUT });
+    const chip = page.locator('.page-header__chips .chip', { hasText: 'My test wallet' });
+    await expect(chip).toBeVisible({ timeout: LOAD_TIMEOUT });
+    await expect(chip).toHaveClass(/chip--wallet/);
+    await expect(chip).toHaveAttribute('title', /My test wallet · wallet · user/);
+
+    // The label must survive a full reload: main.tsx re-applies it from localStorage before the first render.
+    await page.reload();
+    await expect(page.locator('.page-header__chips .chip', { hasText: 'My test wallet' })).toBeVisible({ timeout: LOAD_TIMEOUT });
     expectNoConsoleErrors(consoleErrors);
   });
 });

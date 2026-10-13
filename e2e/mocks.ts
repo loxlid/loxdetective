@@ -47,6 +47,7 @@ const ZERO_ADDRESS = `0x${'00'.repeat(20)}`;
 export const CUSTOM_RPC = 'https://example-rpc.test';
 export const SETTINGS_KEY = 'loxdetective.settings.v1';
 export const CASES_KEY = 'loxdetective.cases.v1';
+export const LABELS_KEY = 'loxdetective.labels.v1';
 
 /** keccak256("Transfer(address,address,uint256)") */
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';

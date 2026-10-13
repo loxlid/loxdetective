@@ -4,6 +4,7 @@ import { allChains } from '@/lib/chains/registry';
 import { DEFAULT_SETTINGS, SETTINGS_STORAGE_KEY, useSettings } from '@/lib/settings/store';
 import { clearPriceCache } from '@/lib/providers/prices';
 import { clearSanctionsCache, sanctionsFeedInfo } from '@/lib/intel/sanctions';
+import { LABEL_CATEGORIES, USER_LABELS_STORAGE_KEY, applyUserLabels, clearUserLabels, exportUserLabelsCsv, loadUserLabels, parseLabelCsv, saveUserLabels } from '@/lib/intel/userLabels';
 import { CASES_STORAGE_KEY } from '@/lib/cases/store';
 import { clearRecentSearches } from '@/hooks/useRecentSearches';
 import { useTheme, type Theme } from '@/hooks/useTheme';
@@ -104,6 +105,9 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<Draft>(() => toDraft(stored));
   const [dirty, setDirty] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
+  const [labelsCsv, setLabelsCsv] = useState<string>(() => exportUserLabelsCsv(loadUserLabels()));
+  const [labelsCount, setLabelsCount] = useState<number>(() => loadUserLabels().length);
+  const [labelErrors, setLabelErrors] = useState<string[]>([]);
 
   // Follow external changes (store hydration, reset) while the form is untouched.
   useEffect(() => {
@@ -140,6 +144,30 @@ export default function SettingsPage() {
     clearRecentSearches();
     bumpLabelsRevision();
     toast.push('Caches cleared (prices, sanctions feed, recent searches)');
+  };
+
+  const importLabels = () => {
+    const { labels, errors } = parseLabelCsv(labelsCsv);
+    setLabelErrors(errors);
+    if (!labels.length && errors.length) {
+      toast.push('No labels imported: fix the lines below', 'error');
+      return;
+    }
+    saveUserLabels(labels);
+    applyUserLabels(labels);
+    bumpLabelsRevision();
+    setLabelsCount(labels.length);
+    if (!errors.length) setLabelsCsv(exportUserLabelsCsv(labels));
+    toast.push(`${labels.length} custom label${labels.length === 1 ? '' : 's'} imported${errors.length ? ` · ${errors.length} line${errors.length === 1 ? '' : 's'} skipped` : ''}`, errors.length ? 'error' : 'success');
+  };
+
+  const clearLabels = () => {
+    clearUserLabels();
+    bumpLabelsRevision();
+    setLabelsCsv(exportUserLabelsCsv([]));
+    setLabelsCount(0);
+    setLabelErrors([]);
+    toast.push('Custom labels cleared');
   };
 
   const feedInfo = feed.data ? { fetchedAt: feed.fetchedAt, eth: feed.ethCount, btc: feed.btcCount } : sanctionsFeedInfo();
@@ -252,6 +280,45 @@ export default function SettingsPage() {
               <textarea data-testid={`settings-rpc-${c.id}`} className="input mono rpc-field__input" rows={2} value={draft.rpc[c.id] ?? ''} onChange={(e) => patchRpc(c.id, e.target.value)} placeholder={c.rpcUrls[0]} spellCheck={false} />
             </label>
           ))}
+        </div>
+      </Card>
+
+      <Card
+        title="Custom labels"
+        subtitle={`Your own address labels, one per line: address,name,category,chain. They override the built-in list and are stored only in this browser (${USER_LABELS_STORAGE_KEY}).`}
+        actions={
+          <button type="button" className="btn btn--ghost btn--sm" data-testid="settings-labels-clear" onClick={clearLabels} disabled={labelsCount === 0}>
+            Clear
+          </button>
+        }
+      >
+        <div className="form-grid">
+          <label className="field">
+            <span className="field__label">Labels CSV</span>
+            <textarea data-testid="settings-labels-csv" className="input mono" rows={8} value={labelsCsv} onChange={(e) => setLabelsCsv(e.target.value)} placeholder="address,name,category,chain" spellCheck={false} />
+            <span className="field__hint">
+              Header and lines starting with <code>#</code> are optional and ignored. Category: {LABEL_CATEGORIES.join(', ')} (blank = wallet). Chain: <code>evm</code> for every EVM network, or a chain id such as{' '}
+              <code>ethereum</code>, <code>base</code>, <code>bitcoin</code>, <code>solana</code> (blank = evm / bitcoin / solana by address shape). Examples:
+            </span>
+            <pre className="mono small settings-labels-example">
+              {['0x1234…abcd,Suspect hot wallet,wallet,evm', 'bc1q…,My exchange deposit,exchange,bitcoin', '5tzF…uAi9,Payout account,other,solana'].join('\n')}
+            </pre>
+          </label>
+          {labelErrors.length > 0 && (
+            <ul className="field__hint settings-labels-errors" role="alert" data-testid="settings-labels-errors">
+              {labelErrors.map((e) => (
+                <li key={e}>{e}</li>
+              ))}
+            </ul>
+          )}
+          <div className="btn-row">
+            <button type="button" className="btn btn--primary" data-testid="settings-labels-import" onClick={importLabels}>
+              Import
+            </button>
+            <p className="muted" data-testid="settings-labels-count">
+              {labelsCount} custom label{labelsCount === 1 ? '' : 's'} active
+            </p>
+          </div>
         </div>
       </Card>
 

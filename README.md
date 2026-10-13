@@ -81,6 +81,11 @@ Block explorers show you *a* transaction. Investigations need the *story*: where
 - **OFAC sanctions**: a built-in snapshot plus an optional daily-refreshed feed from the community mirror of the SDN list (ETH and BTC addresses).
 - Your own case tags become labels everywhere in the UI.
 
+### Custom labels
+- Import your own address labels in **Settings → Custom labels** as CSV lines `address,name,category,chain` (header and `#` comments optional) for EVM, Bitcoin and Solana addresses, e.g. `0x1234…abcd,Suspect hot wallet,wallet,evm`, `bc1q…,My exchange deposit,exchange,bitcoin`, `5tzF…uAi9,Payout account,other,solana`.
+- `category` is one of `exchange, bridge, dex, lending, mixer, sanctioned, scam, token, burn, infrastructure, nft, wallet, other` (blank = `wallet`); `chain` is `evm` (every EVM network) or a chain id such as `ethereum`, `base`, `bitcoin` (blank = `evm` / `bitcoin` / `solana` by address shape). Bad lines are reported with their line number and skipped.
+- Labels live only in your browser (`localStorage['loxdetective.labels.v1']`), are applied at startup, can be exported back as CSV and cleared from Settings. Precedence when several labels match: **case tags > custom labels > built-in labels**.
+
 ### Approvals audit
 - Lists live ERC-20 / ERC-721 / ERC-1155 allowances granted by an address, highlights **unlimited** approvals and unlabelled spenders, and links to the granting transaction.
 - The scan reads `Approval` / `ApprovalForAll` logs over a bounded block range in chunks. When a public RPC refuses part of the range, the approvals found so far are kept and a **scan status** says which blocks were covered and why the scan stopped, so an empty list is never mistaken for "no approvals".

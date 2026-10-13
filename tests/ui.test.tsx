@@ -1040,3 +1040,97 @@ describe('pages', () => {
     expect(html).toBe('<p>ok</p>');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Settings: custom labels card (parser + persistence live in tests/userlabels.test.ts)
+// ---------------------------------------------------------------------------
+
+/*
+ * `vi.resetModules()` runs earlier in this file, so a dynamic import of the
+ * labels modules would get a registry separate from the one SettingsPage uses.
+ * The registry is observed through the statically imported AddressDisplay
+ * instead, and storage through localStorage directly.
+ */
+const UNLABELLED = '0x1234567890123456789012345678901234567890'; // not in BUILTIN_LABELS
+const LABELS_KEY = 'loxdetective.labels.v1';
+
+describe('settings custom labels', () => {
+  const setValue = (el: HTMLTextAreaElement | HTMLInputElement, value: string) => {
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(el, value);
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const chipFor = async (address: string) => {
+    const html = await render(<AddressDisplay address={address} chain="ethereum" labelOnly />);
+    const m = /class="chip chip--[a-z]+[^>]*>([^<]*)/.exec(html);
+    return m ? m[1] : undefined;
+  };
+
+  it('imports a CSV, updates the count line, registers the labels and renders an error line for a bad row', async () => {
+    const m = await mount(<SettingsPage />);
+    const q = <T extends Element>(sel: string) => m.container.querySelector<T>(sel) as T;
+    const countText = () => q<HTMLElement>('[data-testid="settings-labels-count"]').textContent ?? '';
+
+    expect(countText()).toContain('0 custom labels active');
+    expect(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]').value).toContain('address,name,category,chain');
+    expect(q<HTMLButtonElement>('[data-testid="settings-labels-clear"]').disabled).toBe(true);
+    expect(m.container.querySelector('[data-testid="settings-labels-errors"]')).toBeNull();
+    expect(m.container.textContent).toContain('bc1q…,My exchange deposit,exchange,bitcoin');
+    expect(await chipFor(UNLABELLED)).toBeUndefined();
+
+    await act(async () => setValue(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]'), `${UNLABELLED},Suspect hot wallet,wallet,evm\nnot-an-address,Oops\n${USDC},Stablecoin,casino`));
+    await act(async () => q<HTMLButtonElement>('[data-testid="settings-labels-import"]').click());
+
+    expect(countText()).toContain('1 custom label active');
+    const errors = Array.from(m.container.querySelectorAll('[data-testid="settings-labels-errors"] li')).map((li) => li.textContent);
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toMatch(/^Line 2: "not-an-address"/);
+    expect(errors[1]).toMatch(/^Line 3: unknown category "casino"/);
+    // Bad lines are kept in the textarea so they can be fixed.
+    expect(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]').value).toContain('not-an-address');
+    expect(await chipFor(UNLABELLED)).toBe('Suspect hot wallet');
+    const stored = JSON.parse(localStorage.getItem(LABELS_KEY) ?? '[]') as AddressLabel[];
+    expect(stored).toEqual([{ address: UNLABELLED, chain: 'evm', name: 'Suspect hot wallet', category: 'wallet', source: 'user' }]);
+
+    // A clean import normalises the textarea, drops the errors and overrides a built-in label.
+    await act(async () => setValue(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]'), `${UNLABELLED},Suspect,exchange\n${USDC},My stable,token,ethereum`));
+    await act(async () => q<HTMLButtonElement>('[data-testid="settings-labels-import"]').click());
+    expect(countText()).toContain('2 custom labels active');
+    expect(m.container.querySelector('[data-testid="settings-labels-errors"]')).toBeNull();
+    expect(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]').value).toBe(`address,name,category,chain\n${UNLABELLED},Suspect,exchange,evm\n${USDC},My stable,token,ethereum\n`);
+    expect(await chipFor(UNLABELLED)).toBe('Suspect');
+    expect(await chipFor(USDC)).toBe('My stable');
+
+    // Clear unregisters and empties storage; the built-in USDC label is back.
+    expect(q<HTMLButtonElement>('[data-testid="settings-labels-clear"]').disabled).toBe(false);
+    await act(async () => q<HTMLButtonElement>('[data-testid="settings-labels-clear"]').click());
+    expect(countText()).toContain('0 custom labels active');
+    expect(q<HTMLButtonElement>('[data-testid="settings-labels-clear"]').disabled).toBe(true);
+    expect(localStorage.getItem(LABELS_KEY)).toBeNull();
+    expect(await chipFor(UNLABELLED)).toBeUndefined();
+    expect(await chipFor(USDC)).toMatch(/^USDC/); // the built-in label, whatever its exact name
+    m.unmount();
+  });
+
+  it('shows stored labels on mount and saves nothing when every line is bad', async () => {
+    localStorage.setItem(LABELS_KEY, JSON.stringify([{ address: UNLABELLED, chain: 'evm', name: 'Stored', category: 'wallet', source: 'user' }]));
+    const m = await mount(<SettingsPage />);
+    const q = <T extends Element>(sel: string) => m.container.querySelector<T>(sel) as T;
+    expect(q<HTMLElement>('[data-testid="settings-labels-count"]').textContent).toContain('1 custom label active');
+    expect(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]').value).toContain(`${UNLABELLED},Stored,wallet,evm`);
+
+    await act(async () => setValue(q<HTMLTextAreaElement>('[data-testid="settings-labels-csv"]'), 'garbage,Nope'));
+    await act(async () => q<HTMLButtonElement>('[data-testid="settings-labels-import"]').click());
+    expect(q<HTMLElement>('[data-testid="settings-labels-count"]').textContent).toContain('1 custom label active');
+    expect(m.container.querySelectorAll('[data-testid="settings-labels-errors"] li')).toHaveLength(1);
+    expect(JSON.parse(localStorage.getItem(LABELS_KEY) ?? '[]')).toHaveLength(1);
+    m.unmount();
+  });
+
+  it('About explains custom labels and their precedence', async () => {
+    const html = await render(<AboutPage />);
+    expect(html).toContain('Custom labels');
+    expect(html).toContain('loxdetective.labels.v1');
+    expect(html).toContain('case tags &gt; custom labels &gt; built-in labels');
+  });
+});

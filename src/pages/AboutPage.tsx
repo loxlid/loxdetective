@@ -4,6 +4,7 @@ import { SANCTIONS_FEED_URL } from '@/lib/intel/sanctions';
 import { LLAMA_PRICES_URL } from '@/lib/providers/prices';
 import { SETTINGS_STORAGE_KEY } from '@/lib/settings/store';
 import { CASES_STORAGE_KEY } from '@/lib/cases/store';
+import { USER_LABELS_STORAGE_KEY } from '@/lib/intel/userLabels';
 import { usePageTitle } from '@/hooks/usePageTitle';
 import Card from '@/components/Card';
 import ChainBadge from '@/components/ChainBadge';
@@ -46,6 +47,16 @@ export default function AboutPage() {
           <li>Transaction decoding (transfers, internal calls, events), a fund-flow tracer with an interactive graph, deterministic risk heuristics and built-in labels.</li>
           <li>Local investigation cases with tags, notes, saved traces and JSON export / import.</li>
         </ul>
+      </Card>
+
+      <Card title="Custom labels & precedence">
+        <p>
+          Besides the built-in list you can import your own labels in <Link to="/settings">Settings</Link> as CSV (<code>address,name,category,chain</code>), for EVM, Bitcoin and Solana addresses. They are
+          stored only in this browser (<code>{USER_LABELS_STORAGE_KEY}</code>) and show up everywhere a label does: address headers, transaction parties, counterparties, the tracer and its graph. When several
+          labels match the same address, the precedence is <strong>case tags &gt; custom labels &gt; built-in labels</strong> (and the OFAC feed, like custom labels, overrides the built-in list), with the more
+          specific chain scope winning among equals. Custom labels are hints you wrote yourself, so they neither raise nor lower an address's risk score unless their category is one the heuristics look at
+          (<code>mixer</code>, <code>scam</code>, <code>sanctioned</code>, <code>exchange</code>).
+        </p>
       </Card>
 
       <Card title="Data sources & their limits" subtitle="Every request goes straight from your browser to one of these public endpoints. Custom RPCs from Settings are tried first, then Alchemy when a key is set, then the public list.">
@@ -131,7 +142,7 @@ export default function AboutPage() {
             Queries go directly to the public RPCs, explorer APIs and price services listed above, which see your IP address and the addresses you look up, like any block explorer would.
           </li>
           <li>
-            API keys, custom endpoints, theme (<code>{SETTINGS_STORAGE_KEY}</code>), cases (<code>{CASES_STORAGE_KEY}</code>) and recent searches live only in this browser's <code>localStorage</code>. Clear them any time
+            API keys, custom endpoints, theme (<code>{SETTINGS_STORAGE_KEY}</code>), cases (<code>{CASES_STORAGE_KEY}</code>), custom labels (<code>{USER_LABELS_STORAGE_KEY}</code>) and recent searches live only in this browser's <code>localStorage</code>. Clear them any time
             from Settings or your browser.
           </li>
         </ul>

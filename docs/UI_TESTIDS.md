@@ -154,6 +154,24 @@ answers with a JSON-RPC error (`overrideRpc(page, rpcErrorFor('eth_getLogs', …
 in `e2e/mocks.ts`); a trace is saved with `trace-save-case`, listed as
 `case-attachment` on the Cases page and reopened through `case-attachment-open`.
 
+## Additive ids (round 3: custom labels)
+
+Same rules as above. All of them live in the **Custom labels** card of the
+Settings page (`/#/settings`).
+
+| testid | Element | Contract |
+| --- | --- | --- |
+| `settings-labels-csv` | `<textarea>` | CSV of the current custom labels (`address,name,category,chain`, header first). Controlled; `fill()` must update it. After a successful Import with no errors it shows the normalised CSV of what was saved; when some lines failed it keeps the text as typed so they can be fixed. |
+| `settings-labels-import` | `<button>` | Parses the textarea with `parseLabelCsv`, saves the valid rows under `localStorage['loxdetective.labels.v1']`, registers them in the label registry (source `user`) and shows a toast. With errors and no valid row nothing is saved. |
+| `settings-labels-clear` | `<button>` | Unregisters every `user` label, removes the storage key, empties the textarea and errors. Disabled when there are no custom labels. |
+| `settings-labels-count` | `<p>` | Text contains `N custom labels active` (`1 custom label active`), updated right after Import / Clear. |
+| `settings-labels-errors` | `<ul role="alert">` | Rendered only when the last Import had bad lines; one `<li>` per error, each starting with `Line N:`. |
+
+Test flow: fill `settings-labels-csv` with
+`0x742d35Cc6634C0532925a3b844Bc454e4438f44e,Suspect,wallet,evm` → click
+`settings-labels-import` → `settings-labels-count` contains `1 custom label
+active` → reload → the address page header shows `Suspect`.
+
 ## Console hygiene
 
 Every smoke test fails on any `console.error` or uncaught exception, except
